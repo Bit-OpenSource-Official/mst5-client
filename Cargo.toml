@@ -1,0 +1,22 @@
+[package]
+name = "mst5-client"
+version = "0.3.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Complete asynchronous client for the MST5.1 protocol"
+
+[dependencies]
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+getrandom = "0.3.3"
+hkdf = { version = "0.12.4", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+miniz_oxide = "0.9.1"
+sha2 = { version = "0.10.9", default-features = false }
+tokio = { version = "1.47", default-features = false, features = ["net", "io-util", "time", "rt", "sync"] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["getrandom", "reusable_secrets", "zeroize"] }
+zeroize = { version = "1.8.1", default-features = false }
+
+[dev-dependencies]
+micromsg = { path = "../micro-chat/micromsg" }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
