@@ -1,0 +1,17 @@
+[package]
+name = "mst5-android"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jni = "0.21.1"
+libc = "0.2"
+mst5-client = { path = ".." }
+tokio = { version = "1.47", features = ["fs", "rt-multi-thread"] }
+
+[build-dependencies]
+cc = "1.2"

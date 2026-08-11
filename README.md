@@ -76,6 +76,32 @@ async fn main() -> io::Result<()> {
 }
 ```
 
+## Android/JNI
+
+`android-jni` is the Android bridge used by the OVE client. It keeps MST5
+framing, Noise transport, request multiplexing, media streaming and SHA-256
+verification in this crate and passes media through file descriptors instead of
+Java byte arrays.
+
+Build the ARM libraries into a sibling Android checkout with:
+
+```bash
+./android-jni/build-android.sh ../android-client/app/src/main/assets/mst5-native
+```
+
+The regular ARMv7 and ARM64 builds target API 21. The bridge also supports the
+legacy `armeabi` ABI on ARMv6/API 9+. That build uses NDK r14b because r15 raised
+the minimum Android API to 14 and r17 removed `armeabi` entirely. Current Rust
+`std` is rebuilt for ARM1176, and the bridge supplies small bionic compatibility
+wrappers for Linux syscalls that were not exported by Android 2.3.
+
+Build the ARMv6/API 9 library with an extracted NDK r14b:
+
+```bash
+ANDROID_NDK_R14_HOME=/opt/android-ndk-r14b \
+  ./android-jni/build-armv6.sh ../android-client/app/src/main/assets/mst5-native
+```
+
 ## Recipient identifiers
 
 Methods accepting a user or peer through `ToString` can normally receive the same address forms accepted by the server:
