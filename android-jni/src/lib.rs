@@ -1,7 +1,7 @@
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
-use mst5_client::{kind, Client, ClientOptions, RequestOptions};
+use mst5_client::{kind, op, Client, ClientOptions, RequestOptions, Value, VoiceStream};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::FromRawFd;
@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 
-const BRIDGE_VERSION: jint = 1;
+const BRIDGE_VERSION: jint = 2;
 
 struct NativeClient {
     client: Client,
@@ -22,7 +23,9 @@ struct NativeClient {
 
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 static CLIENTS: OnceLock<Mutex<HashMap<i64, Arc<NativeClient>>>> = OnceLock::new();
+static VOICES: OnceLock<Mutex<HashMap<i64, Arc<VoiceStream>>>> = OnceLock::new();
 static NEXT_CLIENT: AtomicI32 = AtomicI32::new(1);
+static NEXT_VOICE: AtomicI32 = AtomicI32::new(1);
 
 fn runtime() -> Result<&'static Runtime, String> {
     RUNTIME
@@ -40,6 +43,10 @@ fn runtime() -> Result<&'static Runtime, String> {
 
 fn clients() -> &'static Mutex<HashMap<i64, Arc<NativeClient>>> {
     CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn voices() -> &'static Mutex<HashMap<i64, Arc<VoiceStream>>> {
+    VOICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
@@ -66,6 +73,148 @@ fn client(handle: jlong) -> Result<Arc<NativeClient>, String> {
         .ok_or_else(|| "MST5 native connection is closed".to_string())
 }
 
+fn voice(handle: jlong) -> Result<Arc<VoiceStream>, String> {
+    voices()
+        .lock()
+        .map_err(|_| "MST5 voice registry is poisoned".to_string())?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| "MST5 voice stream is closed".to_string())
+}
+
+fn opcode(method: &str, raw_path: &str) -> Result<u16, String> {
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let value = match (method, path) {
+        ("POST", "/register") => op::REGISTER,
+        ("POST", "/login") => op::LOGIN,
+        ("POST", "/auth/email/start") => op::EMAIL_AUTH_START,
+        ("POST", "/auth/email/verify") => op::EMAIL_AUTH_VERIFY,
+        ("GET", "/me") => op::ME,
+        ("POST", "/account/delete") => op::ACCOUNT_DELETE,
+        ("POST", "/username") => op::SET_USERNAME,
+        ("POST", "/name") => op::SET_NAME,
+        ("POST", "/privacy") => op::SET_PRIVACY,
+        ("GET", "/contacts") => op::CONTACTS,
+        ("POST", "/contacts/add") => op::CONTACT_ADD,
+        ("POST", "/contacts/delete") => op::CONTACT_DELETE,
+        ("POST", "/groups") => op::CREATE_GROUP,
+        ("POST", "/channels") => op::CREATE_CHANNEL,
+        ("POST", "/chats/title") => op::SET_CHAT_TITLE,
+        ("POST", "/channels/username") => op::SET_CHANNEL_USERNAME,
+        ("POST", "/channels/comments/settings") => op::SET_CHANNEL_COMMENTS,
+        ("POST", "/channels/comments/send") => op::SEND_CHANNEL_COMMENT,
+        ("GET", "/channels/comments") => op::CHANNEL_COMMENTS,
+        ("POST", "/chats/members/add") => op::ADD_CHAT_MEMBER,
+        ("POST", "/chats/members/remove") => op::REMOVE_CHAT_MEMBER,
+        ("POST", "/cloud-password") => op::SET_CLOUD_PASSWORD,
+        ("POST", "/cloud-password/reset") => op::RESET_CLOUD_PASSWORD,
+        ("GET", "/sessions") => op::SESSIONS,
+        ("POST", "/sessions/revoke") => op::REVOKE_SESSION,
+        ("POST", "/sessions/revoke-others") => op::REVOKE_OTHER_SESSIONS,
+        ("POST", "/bots") => op::CREATE_BOT,
+        ("POST", "/bots/token/reset") => op::RESET_BOT_TOKEN,
+        ("POST", "/e2e/key") => op::SET_E2E_KEY,
+        ("GET", "/e2e/key") => op::GET_E2E_KEY,
+        ("POST", "/e2e/backup") => op::SET_E2E_BACKUP,
+        ("GET", "/e2e/backup") => op::GET_E2E_BACKUP,
+        ("POST", "/e2e/reset") => op::RESET_E2E,
+        ("GET", "/wallet") => op::WALLET,
+        ("POST", "/wallet/send") => op::WALLET_SEND,
+        ("GET", "/wallet/history") => op::WALLET_HISTORY,
+        ("POST", "/call") => op::CALL,
+        ("POST", "/voice-ticket") => op::VOICE_TICKET,
+        ("GET", "/voice/participants") => op::VOICE_PARTICIPANTS,
+        ("POST", "/send") => op::SEND,
+        ("POST", "/edit") => op::EDIT,
+        ("POST", "/callback") => op::CALLBACK,
+        ("POST", "/reactions") => op::REACT,
+        ("POST", "/reactions/paid") => op::REACT_PAID,
+        ("POST", "/read") => op::READ,
+        ("POST", "/delete") => op::DELETE,
+        ("POST", "/favorite") => op::FAVORITE,
+        ("GET", "/file/ticket") => op::FILE_TICKET,
+        ("POST", "/forward") => op::FORWARD,
+        ("POST", "/media/quote") => op::MEDIA_QUOTE,
+        ("POST", "/messages/prepare") => op::MESSAGE_PREPARE,
+        ("POST", "/messages/commit") => op::MESSAGE_COMMIT,
+        ("POST", "/messages/cancel") => op::MESSAGE_CANCEL,
+        ("POST", "/profiles/description") => op::SET_PROFILE_DESCRIPTION,
+        ("GET", "/nodes/status") => op::NODES_STATUS,
+        ("GET", "/chats") => op::CHATS,
+        ("POST", "/chats/delete") => op::DELETE_CHAT,
+        ("POST", "/users/ban") => op::BAN_USER,
+        ("POST", "/users/unban") => op::UNBAN_USER,
+        ("GET", "/history") => op::HISTORY,
+        ("GET", "/updates") => op::SYNC,
+        ("GET", "/oauth/device/request") => op::OAUTH_DEVICE_REQUEST,
+        ("POST", "/oauth/device/decision") => op::OAUTH_DEVICE_DECISION,
+        _ => return Err(format!("unsupported MST5 operation {method} {path}")),
+    };
+    Ok(value)
+}
+
+fn value_from_json(value: serde_json::Value) -> Result<Value, String> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                Value::Unsigned(value)
+            } else if let Some(value) = value.as_i64() {
+                Value::Integer(value)
+            } else if let Some(value) = value.as_f64() {
+                Value::Float(value)
+            } else {
+                return Err("invalid JSON number".to_string());
+            }
+        }
+        serde_json::Value::String(value) => Value::Text(value),
+        serde_json::Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(value_from_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        serde_json::Value::Object(values) => Value::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((key, value_from_json(value)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
+}
+
+fn json_from_value(value: Value) -> Result<serde_json::Value, String> {
+    Ok(match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(value) => serde_json::Value::Bool(value),
+        Value::Unsigned(value) => serde_json::Value::Number(value.into()),
+        Value::Integer(value) => serde_json::Value::Number(value.into()),
+        Value::Float(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| "non-finite CBOR number".to_string())?,
+        Value::Bytes(value) => serde_json::Value::Array(
+            value
+                .into_iter()
+                .map(|byte| serde_json::Value::from(byte))
+                .collect(),
+        ),
+        Value::Text(value) => serde_json::Value::String(value),
+        Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(json_from_value)
+                .collect::<Result<_, _>>()?,
+        ),
+        Value::Map(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((key, json_from_value(value)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+    })
+}
+
 fn duplicate_file(fd: jint) -> Result<std::fs::File, String> {
     let owned_fd = unsafe { libc::dup(fd) };
     if owned_fd < 0 {
@@ -75,6 +224,14 @@ fn duplicate_file(fd: jint) -> Result<std::fs::File, String> {
         ));
     }
     Ok(unsafe { std::fs::File::from_raw_fd(owned_fd) })
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 #[no_mangle]
@@ -158,19 +315,17 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeRequest(
     _class: JClass<'_>,
     handle: jlong,
     token: JString<'_>,
-    frame_kind: jint,
-    opcode: jint,
-    request_nonce: JByteArray<'_>,
-    deadline_ms: jlong,
-    payload: JByteArray<'_>,
+    method: JString<'_>,
+    path: JString<'_>,
+    timeout_ms: jint,
+    body: JByteArray<'_>,
 ) -> jbyteArray {
     let result = (|| -> Result<Vec<u8>, String> {
-        if !(0..=u16::MAX as jint).contains(&opcode) {
-            return Err("invalid MST5 opcode".to_string());
-        }
         let token = java_string(&mut env, token)?;
-        let nonce = java_bytes(&mut env, request_nonce)?;
-        let payload = java_bytes(&mut env, payload)?;
+        let method = java_string(&mut env, method)?.to_ascii_uppercase();
+        let path = java_string(&mut env, path)?;
+        let body = java_bytes(&mut env, body)?;
+        let opcode = opcode(&method, &path)?;
         let connection = client(handle)?;
         let mut authenticated = connection
             .token
@@ -183,30 +338,45 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeRequest(
             *authenticated = Some(token);
         }
         drop(authenticated);
-        let mut options = RequestOptions::default();
-        if frame_kind as u8 == kind::COMMAND {
-            if nonce.len() != 16 {
-                return Err("invalid MST5 command nonce".to_string());
+        let frame_kind = if method == "GET" {
+            kind::QUERY
+        } else {
+            kind::COMMAND
+        };
+        let payload = if frame_kind == kind::QUERY {
+            let query = path.split_once('?').map(|(_, value)| value).unwrap_or("");
+            if query.is_empty() {
+                Value::Map(Vec::new())
+            } else {
+                Value::map([("query", Value::Text(query.to_string()))])
             }
-            let mut value = [0u8; 16];
-            value.copy_from_slice(&nonce);
-            options = options.with_request_nonce(value);
-        }
-        if deadline_ms > 0 {
-            options = options.with_deadline_ms(deadline_ms as u64);
-        }
+        } else if body.is_empty() {
+            Value::Map(Vec::new())
+        } else {
+            let json = serde_json::from_slice(&body)
+                .map_err(|error| format!("invalid request JSON: {error}"))?;
+            value_from_json(json)?
+        };
+        let deadline_ms = unix_now_ms().saturating_add(timeout_ms.max(1) as u64);
+        let options = RequestOptions::default().with_deadline_ms(deadline_ms);
         let response = runtime()?
             .block_on(connection.client.request_cbor_with_options(
-                frame_kind as u8,
-                opcode as u16,
-                &payload,
+                frame_kind,
+                opcode,
+                &payload.encode_cbor(),
                 options,
             ))
             .map_err(|error| error.to_string())?;
-        let mut encoded = Vec::with_capacity(3 + response.payload.len());
+        let decoded = Value::decode_cbor(&response.payload).map_err(|error| error.to_string())?;
+        let response_body = match decoded {
+            Value::Bytes(bytes) => bytes,
+            other => serde_json::to_vec(&json_from_value(other)?)
+                .map_err(|error| format!("cannot encode response JSON: {error}"))?,
+        };
+        let mut encoded = Vec::with_capacity(3 + response_body.len());
         encoded.push(response.kind);
         encoded.extend_from_slice(&response.status.to_be_bytes());
-        encoded.extend_from_slice(&response.payload);
+        encoded.extend_from_slice(&response_body);
         Ok(encoded)
     })();
     match result {
@@ -355,6 +525,36 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWriter<W> {
     }
 }
 
+struct MemoryWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl AsyncWrite for MemoryWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        if self.bytes.len().saturating_add(buffer.len()) > self.limit {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "media download exceeds memory limit",
+            )));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 fn transfer_strings(
     env: &mut JNIEnv<'_>,
     endpoint: JString<'_>,
@@ -456,6 +656,156 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownload(
         Err(error) => {
             throw_io(&mut env, error);
             -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadBytes(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+    file_id: JString<'_>,
+    expected_size: jlong,
+    max_bytes: jint,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        if expected_size < 0 || expected_size > jint::MAX as jlong || max_bytes < 1 {
+            return Err("invalid in-memory media size".to_string());
+        }
+        let expected_size = expected_size as usize;
+        let limit = max_bytes as usize;
+        if expected_size > limit {
+            return Err("file is too large".to_string());
+        }
+        let (endpoint, public_key, ticket, file_id) =
+            transfer_strings(&mut env, endpoint, public_key, ticket, file_id)?;
+        let mut target = MemoryWriter {
+            bytes: Vec::with_capacity(expected_size),
+            limit,
+        };
+        runtime()?
+            .block_on(async {
+                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
+                let result = client
+                    .download_media(&file_id, expected_size as u64, &mut target)
+                    .await;
+                let _ = client.close().await;
+                result
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(target.bytes)
+    })();
+    match result {
+        Ok(bytes) => match env.byte_array_from_slice(&bytes) {
+            Ok(array) => array.into_raw(),
+            Err(error) => {
+                throw_io(&mut env, error);
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceOpen(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+) -> jlong {
+    let result = (|| -> Result<i64, String> {
+        let endpoint = java_string(&mut env, endpoint)?;
+        let public_key = java_string(&mut env, public_key)?;
+        let ticket = java_string(&mut env, ticket)?;
+        let stream = runtime()?
+            .block_on(Client::connect_voice(&endpoint, &public_key, &ticket))
+            .map_err(|error| error.to_string())?;
+        let handle = i64::from(NEXT_VOICE.fetch_add(1, Ordering::Relaxed));
+        if handle <= 0 {
+            return Err("MST5 voice stream ID exhausted".to_string());
+        }
+        voices()
+            .lock()
+            .map_err(|_| "MST5 voice registry is poisoned".to_string())?
+            .insert(handle, Arc::new(stream));
+        Ok(handle)
+    })();
+    match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            throw_io(&mut env, error);
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceSend(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    pcm: JByteArray<'_>,
+) {
+    let result = (|| -> Result<(), String> {
+        let pcm = java_bytes(&mut env, pcm)?;
+        runtime()?
+            .block_on(voice(handle)?.send(&pcm))
+            .map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        throw_io(&mut env, error);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceReceive(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        runtime()?
+            .block_on(voice(handle)?.recv())
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(bytes) => match env.byte_array_from_slice(&bytes) {
+            Ok(array) => array.into_raw(),
+            Err(error) => {
+                throw_io(&mut env, error);
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceClose(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) {
+    let stream = voices()
+        .lock()
+        .ok()
+        .and_then(|mut values| values.remove(&handle));
+    if let Some(stream) = stream {
+        if let Ok(runtime) = runtime() {
+            if let Err(error) = runtime.block_on(stream.close()) {
+                throw_io(&mut env, error);
+            }
         }
     }
 }

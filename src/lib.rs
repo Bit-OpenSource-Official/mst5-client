@@ -48,13 +48,15 @@ const FEATURE_IDEMPOTENCY: u64 = 1 << 3;
 const FEATURE_DEADLINE: u64 = 1 << 4;
 const FEATURE_CANCEL: u64 = 1 << 5;
 pub const FEATURE_MEDIA_STREAMS: u64 = 1 << 6;
+pub const FEATURE_VOICE_STREAMS: u64 = 1 << 7;
 const CLIENT_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_STRUCTURED_ERRORS
     | FEATURE_CBOR_QUERY
     | FEATURE_IDEMPOTENCY
     | FEATURE_DEADLINE
     | FEATURE_CANCEL
-    | FEATURE_MEDIA_STREAMS;
+    | FEATURE_MEDIA_STREAMS
+    | FEATURE_VOICE_STREAMS;
 const REQUIRED_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_STRUCTURED_ERRORS
     | FEATURE_CBOR_QUERY
@@ -70,6 +72,7 @@ pub mod feature {
     pub const DEADLINE: u64 = 1 << 4;
     pub const CANCEL: u64 = 1 << 5;
     pub const MEDIA_STREAMS: u64 = 1 << 6;
+    pub const VOICE_STREAMS: u64 = 1 << 7;
 }
 
 pub mod kind {
@@ -97,6 +100,10 @@ pub mod media_op {
     pub const STAT: u16 = 3;
     pub const DELETE: u16 = 4;
     pub const HEALTH: u16 = 5;
+}
+
+pub mod voice_op {
+    pub const JOIN: u16 = 1;
 }
 
 const MEDIA_CHUNK_SIZE: usize = 256 * 1024;
@@ -674,6 +681,45 @@ pub struct Client {
     read_timeout: Duration,
 }
 
+pub struct VoiceStream {
+    client: Client,
+    stream: connection::StreamHandle,
+    read_timeout: Duration,
+}
+
+impl VoiceStream {
+    pub async fn send(&self, pcm: &[u8]) -> io::Result<()> {
+        if pcm.is_empty() || pcm.len() > 64 * 1024 {
+            return Err(invalid_input("voice frame must contain 1..65536 bytes"));
+        }
+        self.stream.send(pcm.to_vec()).await
+    }
+
+    pub async fn recv(&self) -> io::Result<Vec<u8>> {
+        let frame = self.stream.recv(self.read_timeout).await?;
+        match frame.kind {
+            kind::STREAM_DATA if frame.id == self.stream.id() && !frame.payload.is_empty() => {
+                Ok(frame.payload)
+            }
+            kind::STREAM_END | kind::STREAM_ABORT => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "voice stream closed",
+            )),
+            kind::ERROR => Err(api_response_error(
+                frame.code,
+                &Value::decode_cbor(&frame.payload)?,
+            )),
+            _ => Err(invalid_data("unexpected voice stream frame")),
+        }
+    }
+
+    pub async fn close(&self) -> io::Result<()> {
+        let stream_result = self.stream.close().await;
+        let client_result = self.client.close().await;
+        stream_result.and(client_result)
+    }
+}
+
 impl Client {
     pub async fn connect(endpoint: &str, pinned_public_key_b64: &str) -> io::Result<Self> {
         Self::connect_with_options(endpoint, pinned_public_key_b64, ClientOptions::default()).await
@@ -926,6 +972,61 @@ impl Client {
             raw,
         })?;
         Ok(client)
+    }
+
+    pub async fn connect_voice(
+        endpoint: &str,
+        pinned_public_key_b64: &str,
+        ticket: &str,
+    ) -> io::Result<VoiceStream> {
+        let client = Self::connect(endpoint, pinned_public_key_b64).await?;
+        if client.features & FEATURE_VOICE_STREAMS == 0 {
+            return Err(invalid_data("server omitted VOICE_STREAMS"));
+        }
+        let payload = Value::map([
+            ("mechanism", Value::from("voice_ticket")),
+            ("ticket", Value::from(ticket)),
+        ])
+        .encode_cbor();
+        let response = Response::from_frame(
+            client
+                .connection
+                .request(kind::AUTH, 0, [0; 16], 0, payload, client.read_timeout)
+                .await?,
+        );
+        let raw = response.into_result().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("voice authentication failed: {error}"),
+            )
+        })?;
+        client.set_principal(AuthInfo {
+            principal_type: "voice_ticket".to_string(),
+            principal_id: None,
+            scopes: vec!["voice.stream".to_string()],
+            session_id: None,
+            expires_at: None,
+            raw,
+        })?;
+        let deadline_ms = unix_now_ms().saturating_add(duration_ms(client.read_timeout));
+        let stream = client
+            .connection
+            .begin_stream(voice_op::JOIN, Vec::new(), deadline_ms)
+            .await?;
+        let accepted = stream.recv(client.read_timeout).await?;
+        if accepted.kind != kind::ACK || accepted.code != 100 || accepted.id != stream.id() {
+            stream.close().await?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "voice stream rejected",
+            ));
+        }
+        let read_timeout = Duration::from_secs(120);
+        Ok(VoiceStream {
+            client,
+            stream,
+            read_timeout,
+        })
     }
 
     /// Opens a media-node connection using the internal node credential.

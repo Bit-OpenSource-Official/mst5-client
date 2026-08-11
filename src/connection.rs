@@ -36,6 +36,14 @@ pub(super) struct PendingRequest {
     _permit: OwnedSemaphorePermit,
 }
 
+pub(super) struct StreamHandle {
+    connection: Arc<Mst5Connection>,
+    id: u64,
+    receiver: Mutex<mpsc::Receiver<Result<Frame, String>>>,
+    active: AtomicBool,
+    _permit: OwnedSemaphorePermit,
+}
+
 impl Mst5Connection {
     pub(super) fn start(stream: TcpStream, session: Session, write_timeout: Duration) -> Arc<Self> {
         let (reader, writer) = stream.into_split();
@@ -163,6 +171,55 @@ impl Mst5Connection {
         }
     }
 
+    pub(super) async fn begin_stream(
+        self: &Arc<Self>,
+        code: u16,
+        payload: Vec<u8>,
+        deadline_ms: u64,
+    ) -> io::Result<StreamHandle> {
+        let wait_timeout = self.stage_timeout(deadline_ms)?;
+        let permit = tokio::time::timeout(wait_timeout, self.inflight.clone().acquire_owned())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MST5 stream slot timed out"))?
+            .map_err(|_| closed_error())?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_error());
+        }
+        let (sender, receiver) = mpsc::channel(RESPONSE_QUEUE);
+        let wait_timeout = self.stage_timeout(deadline_ms)?;
+        let mut writer = tokio::time::timeout(wait_timeout, self.writer.lock())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "MST5 stream timed out waiting for the record writer",
+                )
+            })?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_error());
+        }
+        let id = writer.next_id;
+        if id == 0 || id == u64::MAX {
+            return Err(invalid_data(
+                "MST5 request ID space exhausted; reconnect required",
+            ));
+        }
+        writer.next_id += 1;
+        self.pending.lock().await.insert(id, sender);
+        let frame = Frame::request(kind::STREAM_OPEN, code, id, [0; 16], deadline_ms, payload)?;
+        if let Err(error) = write_frame_locked(&mut writer, &frame, self.write_timeout).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        Ok(StreamHandle {
+            connection: self.clone(),
+            id,
+            receiver: Mutex::new(receiver),
+            active: AtomicBool::new(true),
+            _permit: permit,
+        })
+    }
+
     pub(super) fn subscribe(&self) -> EventReceiver {
         EventReceiver {
             receiver: self.events.subscribe(),
@@ -268,6 +325,67 @@ impl Mst5Connection {
         }
         // Late replies after timeout/CANCEL are valid and intentionally ignored.
         Ok(())
+    }
+}
+
+impl StreamHandle {
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(super) async fn recv(&self, duration: Duration) -> io::Result<Frame> {
+        let mut receiver = self.receiver.lock().await;
+        match tokio::time::timeout(duration, receiver.recv()).await {
+            Ok(Some(Ok(frame))) => Ok(frame),
+            Ok(Some(Err(message))) => Err(io::Error::new(io::ErrorKind::ConnectionReset, message)),
+            Ok(None) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "MST5 stream closed",
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "MST5 stream read timed out",
+            )),
+        }
+    }
+
+    pub(super) async fn send(&self, payload: Vec<u8>) -> io::Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(closed_error());
+        }
+        self.connection
+            .write_control(&Frame::new(kind::STREAM_DATA, 0, self.id, payload)?)
+            .await
+    }
+
+    pub(super) async fn close(&self) -> io::Result<()> {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = self
+            .connection
+            .write_control(&Frame::new(kind::STREAM_END, 200, self.id, Vec::new())?)
+            .await;
+        self.connection.remove_pending(self.id).await;
+        result
+    }
+}
+
+impl Drop for StreamHandle {
+    fn drop(&mut self) {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let connection = self.connection.clone();
+        let id = self.id;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Ok(frame) = Frame::new(kind::STREAM_ABORT, 499, id, Vec::new()) {
+                    let _ = connection.write_control(&frame).await;
+                }
+                connection.remove_pending(id).await;
+            });
+        }
     }
 }
 

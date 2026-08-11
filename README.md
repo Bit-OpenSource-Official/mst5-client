@@ -19,6 +19,7 @@ The transport is native async and uses `tokio::net::TcpStream`. The crate does n
 - built-in CBOR subset used by the server
 - high-level account, messaging, bot, wallet, chat, E2E, media and node methods
 - direct media-node upload/download streams with ticket authentication, node pinning and SHA-256 verification
+- dedicated bidirectional voice streams using MST5 `STREAM_OPEN/DATA/END`
 - low-level opcode API remains available
 
 ## Dependencies
@@ -78,9 +79,9 @@ async fn main() -> io::Result<()> {
 
 ## Android/JNI
 
-`android-jni` is the Android bridge used by the OVE client. It keeps MST5
-framing, Noise transport, request multiplexing, media streaming and SHA-256
-verification in this crate and passes media through file descriptors instead of
+`android-jni` is the Android bridge used by the OVE client. It keeps all MST5
+framing, Noise transport, request multiplexing, JSON/CBOR conversion, media and
+voice streaming in this crate. Media passes through file descriptors instead of
 Java byte arrays.
 
 Build the ARM libraries into a sibling Android checkout with:
@@ -410,6 +411,18 @@ client.read_messages("@alice").await?;
 | `call(to, action).await` | User | `Value` | Direct call signaling. Direct calls explicitly reject bots. |
 | `create_voice_ticket(peer).await` | Both* | `Value` | Create a voice ticket. Group voice can be reachable by bots; direct user voice rejects bots. |
 | `voice_participants(peer).await` | Both | `Value` | List group voice participants. |
+
+Voice audio uses a dedicated ticket-authenticated MST5 stream:
+
+```rust
+let ticket = client.create_voice_ticket("@alice").await?;
+let ticket = ticket.get("ticket").and_then(mst5_client::Value::as_str)
+    .ok_or_else(|| std::io::Error::other("missing voice ticket"))?;
+let voice = Client::connect_voice(endpoint, server_public_key_b64, ticket).await?;
+voice.send(&pcm_frame).await?;
+let received_pcm = voice.recv().await?;
+voice.close().await?;
+```
 
 ## Messaging API
 

@@ -108,6 +108,8 @@ async fn real_server_multiplex_cancel_and_reuse() -> io::Result<()> {
         .expect_err("unknown opcode must return a structured error");
     assert_eq!(unknown.status, 404);
     assert_eq!(unknown.code, "NOT_FOUND");
+
+    voice_round_trip(&address, &base64(public.as_bytes()), &client, &username).await?;
     client.close().await?;
 
     let invalid_pin = base64(&[0x33; 32]);
@@ -122,6 +124,62 @@ async fn real_server_multiplex_cancel_and_reuse() -> io::Result<()> {
     rotated.close().await?;
 
     media_node_round_trip().await?;
+    Ok(())
+}
+
+async fn voice_round_trip(
+    address: &str,
+    public_key: &str,
+    first: &Client,
+    first_username: &str,
+) -> io::Result<()> {
+    let second = Client::connect(&format!("tcp://{address}"), public_key).await?;
+    let second_username = format!("mst5_voice_{}", now_ms());
+    second
+        .register(&second_username, "password123", None)
+        .await?;
+
+    let first_ticket = first
+        .command(
+            op::VOICE_TICKET,
+            Value::map([("peer", Value::from(second_username.as_str()))]),
+        )
+        .await?
+        .into_result()?
+        .get("ticket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing first voice ticket"))?
+        .to_string();
+    let second_ticket = second
+        .command(
+            op::VOICE_TICKET,
+            Value::map([("peer", Value::from(first_username))]),
+        )
+        .await?
+        .into_result()?
+        .get("ticket")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing second voice ticket"))?
+        .to_string();
+
+    let first_voice =
+        Client::connect_voice(&format!("tcp://{address}"), public_key, &first_ticket).await?;
+    assert!(
+        Client::connect_voice(&format!("tcp://{address}"), public_key, &first_ticket)
+            .await
+            .is_err(),
+        "voice tickets must be single-use"
+    );
+    let second_voice =
+        Client::connect_voice(&format!("tcp://{address}"), public_key, &second_ticket).await?;
+    first_voice.send(b"mst5 voice frame").await?;
+    let received = tokio::time::timeout(Duration::from_secs(2), second_voice.recv())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "voice frame was not relayed"))??;
+    assert_eq!(received, b"mst5 voice frame");
+    first_voice.close().await?;
+    second_voice.close().await?;
+    second.close().await?;
     Ok(())
 }
 
