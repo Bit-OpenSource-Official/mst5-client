@@ -178,6 +178,10 @@ pub mod op {
     pub const MESSAGE_COMMIT: u16 = 72;
     pub const MESSAGE_CANCEL: u16 = 73;
     pub const SET_PROFILE_DESCRIPTION: u16 = 74;
+    pub const NOTIFYBOT_DRAFT: u16 = 75;
+    pub const NOTIFYBOT_CONFIRM: u16 = 76;
+    pub const NOTIFYBOT_CANCEL: u16 = 77;
+    pub const NOTIFYBOT_WORK: u16 = 78;
 }
 
 #[derive(Clone, Debug, PartialEq)]
