@@ -24,6 +24,26 @@ pub mod image;
 pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
 use connection::Mst5Connection;
 
+/// Production server pin embedded by the build through
+/// `CRYPT_SERVER_PUBLIC_KEY_B64`, when configured.
+///
+/// The value is a public key, not a private credential. It remains extractable
+/// from a distributed native library even though it is supplied through CI
+/// secrets rather than committed to source control.
+pub const COMPILED_SERVER_PUBLIC_KEY_B64: Option<&str> = option_env!("CRYPT_SERVER_PUBLIC_KEY_B64");
+
+pub fn compiled_server_public_key_b64() -> io::Result<&'static str> {
+    COMPILED_SERVER_PUBLIC_KEY_B64
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "mst5-client was built without CRYPT_SERVER_PUBLIC_KEY_B64",
+            )
+        })
+}
+
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
 const SERVER_MAGIC: &[u8; 4] = b"RSP5";
 const HANDSHAKE_MESSAGE_LEN: usize = 48;
@@ -729,6 +749,11 @@ impl VoiceStream {
 }
 
 impl Client {
+    /// Connect using the server pin embedded in this mst5-client build.
+    pub async fn connect_compiled(endpoint: &str) -> io::Result<Self> {
+        Self::connect(endpoint, compiled_server_public_key_b64()?).await
+    }
+
     pub async fn connect(endpoint: &str, pinned_public_key_b64: &str) -> io::Result<Self> {
         Self::connect_with_options(endpoint, pinned_public_key_b64, ClientOptions::default()).await
     }
@@ -912,6 +937,13 @@ impl Client {
         token: &str,
     ) -> io::Result<Self> {
         let client = Self::connect(endpoint, pinned_public_key_b64).await?;
+        client.authenticate(token).await?;
+        Ok(client)
+    }
+
+    /// Connect and authenticate using the server pin embedded in this build.
+    pub async fn connect_authenticated_compiled(endpoint: &str, token: &str) -> io::Result<Self> {
+        let client = Self::connect_compiled(endpoint).await?;
         client.authenticate(token).await?;
         Ok(client)
     }
@@ -3399,6 +3431,22 @@ mod tests {
         let decoded = decode_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
         assert_eq!(decoded.len(), 32);
         assert!(decoded.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn compiled_server_pin_is_valid_when_present() {
+        if let Some(value) = COMPILED_SERVER_PUBLIC_KEY_B64
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            assert_eq!(compiled_server_public_key_b64().unwrap(), value);
+            assert_eq!(decode_base64(value).unwrap().len(), 32);
+        } else {
+            assert_eq!(
+                compiled_server_public_key_b64().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
     }
 
     #[test]

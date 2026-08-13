@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  CRYPT_SERVER_PUBLIC_KEY_B64: ${{ secrets.CRYPT_SERVER_PUBLIC_KEY_B64 }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -37,6 +40,11 @@ jobs:
           ffi="$(sed -n 's/^version = "\([^"]*\)"/\1/p' ffi/Cargo.toml | head -n1)"
           [[ "$version" == "$crate" && "$version" == "$ffi" ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Validate embedded production server pin
+        run: |
+          [[ -n "${CRYPT_SERVER_PUBLIC_KEY_B64:-}" ]]
+          decoded_size="$(printf '%s' "$CRYPT_SERVER_PUBLIC_KEY_B64" | base64 --decode | wc -c)"
+          [[ "$decoded_size" == 32 ]]
 
   linux:
     needs: [test, version]

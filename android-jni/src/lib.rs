@@ -5,7 +5,10 @@ use jni::objects::{
 use jni::sys::{jboolean, jbyteArray, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore};
-use mst5_client::{AccountClient, AccountConfig, Client, RequestOptions, VoiceStream};
+use mst5_client::{
+    compiled_server_public_key_b64, AccountClient, AccountConfig, Client, RequestOptions,
+    VoiceStream,
+};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::FromRawFd;
@@ -155,7 +158,8 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
 ) -> jlong {
     let result = (|| -> Result<i64, String> {
         let endpoint = java_string(&mut env, endpoint)?;
-        let public_key = java_string(&mut env, public_key)?;
+        let supplied_public_key = java_string(&mut env, public_key)?;
+        let public_key = compiled_server_public_key_b64().unwrap_or(&supplied_public_key);
         let mut config = AccountConfig::new(endpoint, public_key, "", "OVE.rs Android");
         config.options.read_timeout = Duration::from_secs(120);
         config.options.write_timeout = Duration::from_secs(30);

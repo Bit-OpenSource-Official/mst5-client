@@ -1,5 +1,5 @@
 use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore, BACKUP_VERSION, ENVELOPE_VERSION};
-use mst5_client::{Client, RequestOptions};
+use mst5_client::{compiled_server_public_key_b64, Client, RequestOptions};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
@@ -137,6 +137,20 @@ pub unsafe extern "C" fn mst5_client_connect(endpoint: *const c_char, key: *cons
         if out.is_null() { return Err((INVALID_ARGUMENT, "out_client is null".to_string())); }
         let endpoint = text(endpoint, "endpoint")?;
         let key = text(key, "server_public_key_b64")?;
+        let client = runtime().map_err(io_error)?.block_on(Client::connect(endpoint, key)).map_err(io_error)?;
+        let handle = next_handle()?;
+        clients().lock().map_err(|_| io_error("client registry poisoned"))?.insert(handle, client);
+        ptr::write(out, handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mst5_client_connect_compiled(endpoint: *const c_char, out: *mut u64) -> i32 {
+    guard(|| {
+        if out.is_null() { return Err((INVALID_ARGUMENT, "out_client is null".to_string())); }
+        let endpoint = text(endpoint, "endpoint")?;
+        let key = compiled_server_public_key_b64().map_err(io_error)?;
         let client = runtime().map_err(io_error)?.block_on(Client::connect(endpoint, key)).map_err(io_error)?;
         let handle = next_handle()?;
         clients().lock().map_err(|_| io_error("client registry poisoned"))?.insert(handle, client);

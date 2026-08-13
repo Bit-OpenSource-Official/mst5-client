@@ -40,6 +40,8 @@ MST5_API void mst5_buffer_free(mst5_buffer buffer);
 
 MST5_API int32_t mst5_client_connect(const char *endpoint, const char *server_public_key_b64,
                                      mst5_client_t *out_client);
+MST5_API int32_t mst5_client_connect_compiled(const char *endpoint,
+                                              mst5_client_t *out_client);
 MST5_API int32_t mst5_client_authenticate(mst5_client_t client, const char *token);
 MST5_API int32_t mst5_client_request(mst5_client_t client, uint8_t kind, uint16_t opcode,
                                      const uint8_t *payload, size_t payload_len,

@@ -33,6 +33,21 @@ impl AccountConfig {
             reconnect_max: Duration::from_secs(60),
         }
     }
+
+    /// Create an account reactor configuration using the pin embedded in the
+    /// mst5-client build.
+    pub fn with_compiled_key(
+        endpoint: impl Into<String>,
+        token: impl Into<String>,
+        client_name: impl Into<String>,
+    ) -> io::Result<Self> {
+        Ok(Self::new(
+            endpoint,
+            crate::compiled_server_public_key_b64()?,
+            token,
+            client_name,
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]

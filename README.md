@@ -32,6 +32,13 @@ The transport is native async and uses `tokio::net::TcpStream`. The crate does n
 Windows, macOS, Android and iOS and publishes them with checksums in release
 `v0.5.0`. Existing release branches are updated only by fast-forward.
 
+Official release artifacts embed the production X25519 server pin from the
+`CRYPT_SERVER_PUBLIC_KEY_B64` GitHub Actions secret. Release builds fail before
+the platform matrix starts when the secret is absent or does not decode to 32
+bytes. The value is a public pin and can be extracted from a distributed binary;
+using a secret here keeps environment-specific configuration out of Git, not out
+of the hands of library users.
+
 ## Dependencies
 
 Runtime dependencies are intentionally small:
@@ -133,6 +140,19 @@ This is also useful with methods such as `add_contact`, `history`, `read_message
 let client = Client::connect(endpoint, server_public_key_b64).await?;
 client.authenticate(token).await?;
 ```
+
+### Pin embedded at build time
+
+```rust
+let client = Client::connect_authenticated_compiled(endpoint, token).await?;
+```
+
+Set `CRYPT_SERVER_PUBLIC_KEY_B64` while compiling to enable this API. The build
+fails if the value is not valid Base64 containing exactly 32 bytes. C consumers
+can use `mst5_client_connect_compiled`; Android account connections prefer the
+compiled pin and retain the Java-supplied pin only as a fallback for local builds
+made without the environment variable. Media and voice connections continue to
+use their node-specific pins.
 
 ### Connect and authenticate in one call
 
