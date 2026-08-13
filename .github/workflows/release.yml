@@ -60,7 +60,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@cross
       - uses: taiki-e/install-action@cargo-zigbuild
       - uses: mlugg/setup-zig@v2
         with:
@@ -68,19 +67,21 @@ jobs:
       - name: Build native library
         run: |
           target="${{ matrix.target }}"
-          if [[ "$target" == *-gnu ]]; then
+          rustup target add "$target"
+          zig_target="$target"
+          if [[ "$target" == *-gnu* ]]; then
             baseline=2.17
             [[ "$target" == riscv64gc-* ]] && baseline=2.27
-            rustup target add "$target"
-            cargo zigbuild --locked --release --target "${target}.${baseline}" --manifest-path ffi/Cargo.toml
+            zig_target="${target}.${baseline}"
+          fi
+          cargo zigbuild --locked --release --target "$zig_target" --manifest-path ffi/Cargo.toml
+          if [[ "$target" == *-gnu* ]]; then
             library="ffi/target/${target}/release/libmst5_client_ffi.so"
             required="$(readelf -W --version-info "$library" | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -n1)"
             if [[ -n "$required" && "$(printf '%s\n%s\n' "$required" "$baseline" | sort -V | tail -n1)" != "$baseline" ]]; then
               echo "$library requires glibc $required, expected <= $baseline" >&2
               exit 1
             fi
-          else
-            cross build --locked --release --target "$target" --manifest-path ffi/Cargo.toml
           fi
       - run: ./scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.target }}"
       - uses: actions/upload-artifact@v4
