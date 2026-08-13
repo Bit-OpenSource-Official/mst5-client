@@ -18,6 +18,7 @@ use x25519_dalek::{PublicKey, ReusableSecret};
 use zeroize::Zeroize;
 
 mod connection;
+pub mod e2e;
 use connection::Mst5Connection;
 
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
@@ -1833,7 +1834,10 @@ impl Client {
     pub async fn set_e2e_key(&self, public_key_b64: &str) -> io::Result<Value> {
         self.command_result(
             op::SET_E2E_KEY,
-            Value::map([("public_key", Value::from(public_key_b64))]),
+            Value::map([
+                ("version", Value::from(3_i64)),
+                ("public_key", Value::from(public_key_b64)),
+            ]),
         )
         .await
     }

@@ -1,6 +1,7 @@
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
+use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore};
 use mst5_client::{kind, op, Client, ClientOptions, RequestOptions, Value, VoiceStream};
 use std::collections::HashMap;
 use std::io;
@@ -26,6 +27,9 @@ static CLIENTS: OnceLock<Mutex<HashMap<i64, Arc<NativeClient>>>> = OnceLock::new
 static VOICES: OnceLock<Mutex<HashMap<i64, Arc<VoiceStream>>>> = OnceLock::new();
 static NEXT_CLIENT: AtomicI32 = AtomicI32::new(1);
 static NEXT_VOICE: AtomicI32 = AtomicI32::new(1);
+static IDENTITIES: OnceLock<Mutex<HashMap<i64, Arc<Identity>>>> = OnceLock::new();
+static NEXT_IDENTITY: AtomicI32 = AtomicI32::new(1);
+static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
 
 fn runtime() -> Result<&'static Runtime, String> {
     RUNTIME
@@ -47,6 +51,34 @@ fn clients() -> &'static Mutex<HashMap<i64, Arc<NativeClient>>> {
 
 fn voices() -> &'static Mutex<HashMap<i64, Arc<VoiceStream>>> {
     VOICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn identities() -> &'static Mutex<HashMap<i64, Arc<Identity>>> {
+    IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn identity(handle: jlong) -> Result<Arc<Identity>, String> {
+    identities()
+        .lock()
+        .map_err(|_| "MST5 E2E identity registry is poisoned".to_string())?
+        .get(&handle)
+        .cloned()
+        .ok_or_else(|| "MST5 E2E identity is closed".to_string())
+}
+
+extern "C" fn native_crash_signal(signal: libc::c_int) {
+    let fd = CRASH_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        const SIGNAL_OFFSET: usize = b"[OVE_ANDROID_CRASH_V1]\nSource: native-signal\nSignal: ".len();
+        let mut line = *b"[OVE_ANDROID_CRASH_V1]\nSource: native-signal\nSignal: 00\n";
+        line[SIGNAL_OFFSET] = b'0' + ((signal / 10).clamp(0, 9) as u8);
+        line[SIGNAL_OFFSET + 1] = b'0' + ((signal % 10).clamp(0, 9) as u8);
+        unsafe { libc::write(fd, line.as_ptr().cast(), line.len()); }
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
 }
 
 fn java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
@@ -808,4 +840,189 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceClose(
             }
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EOpen(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    path: JString<'_>,
+    create: jboolean,
+) -> jlong {
+    let result = (|| -> Result<i64, String> {
+        let store = IdentityStore::new(java_string(&mut env, path)?);
+        let value = if create != JNI_FALSE {
+            store.load_or_create()
+        } else {
+            store
+                .load()
+                .and_then(|value| value.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "E2E identity not found")))
+        }
+        .map_err(|error| error.to_string())?;
+        let handle = i64::from(NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed));
+        identities()
+            .lock()
+            .map_err(|_| "MST5 E2E identity registry is poisoned".to_string())?
+            .insert(handle, Arc::new(value));
+        Ok(handle)
+    })();
+    match result {
+        Ok(handle) => handle,
+        Err(error) => { throw_io(&mut env, error); 0 }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EClose(
+    _env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong,
+) {
+    if let Ok(mut values) = identities().lock() { values.remove(&handle); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2ERemove(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, path: JString<'_>,
+) {
+    let result = java_string(&mut env, path)
+        .and_then(|path| IdentityStore::new(path).remove().map_err(|error| error.to_string()));
+    if let Err(error) = result { throw_io(&mut env, error); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EPublicKey(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong,
+) -> jbyteArray {
+    match identity(handle) {
+        Ok(value) => env.byte_array_from_slice(&value.public_key()).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EFingerprint(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong,
+) -> jbyteArray {
+    match identity(handle) {
+        Ok(value) => env.byte_array_from_slice(value.fingerprint().as_bytes()).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EPublicFingerprint(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, public_key: JByteArray<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<String, String> {
+        let public_key: [u8; 32] = java_bytes(&mut env, public_key)?
+            .try_into()
+            .map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        Ok(mst5_client::e2e::fingerprint(&public_key))
+    })();
+    match result {
+        Ok(value) => env.byte_array_from_slice(value.as_bytes()).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2ESeal(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong, peer: JByteArray<'_>,
+    from: JString<'_>, to: JString<'_>, plaintext: JByteArray<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        let peer: [u8; 32] = java_bytes(&mut env, peer)?.try_into().map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        let from = java_string(&mut env, from)?;
+        let to = java_string(&mut env, to)?;
+        let plaintext = java_bytes(&mut env, plaintext)?;
+        let value = identity(handle)?.seal(peer, &from, &to, &plaintext).map_err(|error| error.to_string())?;
+        let mut encoded = Vec::with_capacity(25 + value.ciphertext.len());
+        encoded.push(value.version); encoded.extend_from_slice(&value.nonce); encoded.extend_from_slice(&value.ciphertext);
+        Ok(encoded)
+    })();
+    match result {
+        Ok(value) => env.byte_array_from_slice(&value).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EDecrypt(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong, peer: JByteArray<'_>,
+    from: JString<'_>, to: JString<'_>, encoded: JByteArray<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        let peer: [u8; 32] = java_bytes(&mut env, peer)?.try_into().map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        let from = java_string(&mut env, from)?;
+        let to = java_string(&mut env, to)?;
+        let encoded = java_bytes(&mut env, encoded)?;
+        if encoded.len() < 41 || encoded[0] != 3 { return Err("invalid E2E v3 envelope".to_string()); }
+        let value = Envelope { version: encoded[0], nonce: encoded[1..25].try_into().unwrap(), ciphertext: encoded[25..].to_vec() };
+        identity(handle)?.open(peer, &from, &to, &value).map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => env.byte_array_from_slice(&value).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EBackup(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, handle: jlong, password: JString<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        let password = java_string(&mut env, password)?;
+        let value = identity(handle)?.backup(&password).map_err(|error| error.to_string())?;
+        let mut encoded = Vec::with_capacity(41 + value.ciphertext.len());
+        encoded.push(value.version); encoded.extend_from_slice(&value.salt); encoded.extend_from_slice(&value.nonce); encoded.extend_from_slice(&value.ciphertext);
+        Ok(encoded)
+    })();
+    match result {
+        Ok(value) => env.byte_array_from_slice(&value).map(|array| array.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2ERestore(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, path: JString<'_>, password: JString<'_>, encoded: JByteArray<'_>,
+) -> jlong {
+    let result = (|| -> Result<i64, String> {
+        let path = java_string(&mut env, path)?;
+        let password = java_string(&mut env, password)?;
+        let encoded = java_bytes(&mut env, encoded)?;
+        if encoded.len() != 89 || encoded[0] != 2 { return Err("invalid E2E backup v2".to_string()); }
+        let backup = Backup { version: encoded[0], salt: encoded[1..17].try_into().unwrap(), nonce: encoded[17..41].try_into().unwrap(), ciphertext: encoded[41..].to_vec() };
+        let value = Identity::restore(&backup, &password).map_err(|error| error.to_string())?;
+        IdentityStore::new(path).save(&value).map_err(|error| error.to_string())?;
+        let handle = i64::from(NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed));
+        identities().lock().map_err(|_| "MST5 E2E identity registry is poisoned".to_string())?.insert(handle, Arc::new(value));
+        Ok(handle)
+    })();
+    match result { Ok(handle) => handle, Err(error) => { throw_io(&mut env, error); 0 } }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeInstallCrashHandler(
+    mut env: JNIEnv<'_>, _class: JClass<'_>, path: JString<'_>,
+) {
+    let result = (|| -> Result<(), String> {
+        let path = java_string(&mut env, path)?;
+        let c_path = std::ffi::CString::new(path.clone()).map_err(|_| "invalid crash report path".to_string())?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND, 0o600) };
+        if fd < 0 { return Err(format!("cannot open native crash report: {}", io::Error::last_os_error())); }
+        let previous_fd = CRASH_FD.swap(fd, Ordering::SeqCst);
+        if previous_fd >= 0 { unsafe { libc::close(previous_fd); } }
+        for signal in [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+            unsafe { libc::signal(signal, native_crash_signal as *const () as libc::sighandler_t); }
+        }
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(file, "[OVE_ANDROID_CRASH_V1]\nSource: rust-panic\n{info}");
+                let _ = file.sync_all();
+            }
+        }));
+        Ok(())
+    })();
+    if let Err(error) = result { throw_io(&mut env, error); }
 }

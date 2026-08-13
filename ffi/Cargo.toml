@@ -1,0 +1,17 @@
+[package]
+name = "mst5-client-ffi"
+version = "0.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+mst5-client = { path = ".." }
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
+zeroize = { version = "1.8.1", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+cc = "1.2"

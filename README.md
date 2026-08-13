@@ -1,6 +1,6 @@
 # mst5-client
 
-Complete asynchronous Rust client for the wire-breaking MST5.1 protocol used by MicroMsg / OVE Messenger.
+Complete asynchronous Rust client for the wire-breaking MST5.1 protocol used by MicroMsg / OVE Messenger. Version 0.4 adds application E2E v3, password backup v2 and a stable C ABI.
 
 The transport is native async and uses `tokio::net::TcpStream`. The crate does not use an HTTP bridge, OpenSSL, `spawn_blocking`, or synchronous sockets.
 
@@ -21,6 +21,16 @@ The transport is native async and uses `tokio::net::TcpStream`. The crate does n
 - direct media-node upload/download streams with ticket authentication, node pinning and SHA-256 verification
 - dedicated bidirectional voice streams using MST5 `STREAM_OPEN/DATA/END`
 - low-level opcode API remains available
+- application E2E v3 (X25519, HKDF-SHA256, XChaCha20-Poly1305)
+- Argon2id/XChaCha20-Poly1305 E2E key backups and atomic private identity storage
+- stable opaque-handle C ABI in `ffi/include/mst5.h`
+
+## Native releases
+
+`make release-branch 0.4.0` publishes the current clean `main` commit to
+`release/0.4.0`. GitHub Actions builds C ABI archives for Linux glibc/musl,
+Windows, macOS, Android and iOS and publishes them with checksums in release
+`v0.4.0`. Existing release branches are updated only by fast-forward.
 
 ## Dependencies
 

@@ -1,0 +1,233 @@
+name: MST5 native SDK
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --manifest-path ffi/Cargo.toml
+      - name: Native C ABI smoke
+        run: |
+          cargo build --locked --release --manifest-path ffi/Cargo.toml
+          cc ffi/tests/smoke.c -Iffi/include -Lffi/target/release \
+            -Wl,-rpath,"$PWD/ffi/target/release" -lmst5_client_ffi -o /tmp/mst5-smoke
+          /tmp/mst5-smoke
+
+  version:
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          version="${GITHUB_REF_NAME#release/}"
+          crate="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          ffi="$(sed -n 's/^version = "\([^"]*\)"/\1/p' ffi/Cargo.toml | head -n1)"
+          [[ "$version" == "$crate" && "$version" == "$ffi" ]]
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: [test, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - i686-unknown-linux-gnu
+          - arm-unknown-linux-gnueabi
+          - armv7-unknown-linux-gnueabihf
+          - aarch64-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-musl
+          - riscv64gc-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cross
+      - uses: taiki-e/install-action@cargo-zigbuild
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Build native library
+        run: |
+          target="${{ matrix.target }}"
+          if [[ "$target" == *-gnu ]]; then
+            baseline=2.17
+            [[ "$target" == riscv64gc-* ]] && baseline=2.27
+            rustup target add "$target"
+            cargo zigbuild --locked --release --target "${target}.${baseline}" --manifest-path ffi/Cargo.toml
+            library="ffi/target/${target}/release/libmst5_client_ffi.so"
+            required="$(readelf -W --version-info "$library" | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -n1)"
+            if [[ -n "$required" && "$(printf '%s\n%s\n' "$required" "$baseline" | sort -V | tail -n1)" != "$baseline" ]]; then
+              echo "$library requires glibc $required, expected <= $baseline" >&2
+              exit 1
+            fi
+          else
+            cross build --locked --release --target "$target" --manifest-path ffi/Cargo.toml
+          fi
+      - run: ./scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  windows:
+    needs: [test, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [i686-pc-windows-msvc, x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target "${{ matrix.target }}" --manifest-path ffi/Cargo.toml
+      - shell: bash
+        run: ./scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  apple:
+    needs: [test, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target "${{ matrix.target }}" --manifest-path ffi/Cargo.toml
+      - run: ./scripts/package-native.sh "${{ matrix.target }}" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  android:
+    needs: [test, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,arm-linux-androideabi
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;26.3.11579264"
+      - run: |
+          curl -fsSL -o "$RUNNER_TEMP/ndk-r14b.zip" https://dl.google.com/android/repository/android-ndk-r14b-linux-x86_64.zip
+          unzip -q "$RUNNER_TEMP/ndk-r14b.zip" -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_R14_HOME=$RUNNER_TEMP/android-ndk-r14b" >> "$GITHUB_ENV"
+      - run: ./android-jni/build-android.sh "$PWD/dist/android/assets/mst5-native" "$PWD/dist/android/cabi"
+      - run: ./android-jni/build-armv6.sh "$PWD/dist/android/assets/mst5-native" "$PWD/dist/android/cabi"
+      - run: |
+          cp -r ffi/include dist/android/
+          version="${{ needs.version.outputs.value }}"
+          printf '{"abi":1,"version":"%s","target":"android"}\n' "$version" > dist/android/manifest.json
+          tar -C dist -czf "dist/mst5-client-${version}-android.tar.gz" android
+          for spec in armv6:armeabi armv7:armeabi-v7a arm64:arm64-v8a x86_64:x86_64; do
+            label="${spec%%:*}"
+            abi="${spec#*:}"
+            root="dist/android-${label}"
+            mkdir -p "$root/include" "$root/lib"
+            cp ffi/include/mst5.h "$root/include/"
+            cp "dist/android/cabi/${abi}/libmst5_client_ffi.so" "$root/lib/"
+            printf '{"abi":1,"version":"%s","target":"android-%s"}\n' "$version" "$label" > "$root/manifest.json"
+            tar -C dist -czf "dist/mst5-client-${version}-android-${label}.tar.gz" "android-${label}"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-android
+          path: dist/*.tar.gz
+
+  apple-bundles:
+    needs: [version, apple]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*-apple-*
+          merge-multiple: true
+          path: input
+      - name: Build universal macOS and XCFramework bundles
+        run: |
+          version="${{ needs.version.outputs.value }}"
+          mkdir -p stage dist/macos-universal/include dist/macos-universal/lib xc
+          for archive in input/*.tar.gz; do tar -C stage -xzf "$archive"; done
+          cp ffi/include/mst5.h dist/macos-universal/include/
+          lipo -create \
+            stage/x86_64-apple-darwin/lib/libmst5_client_ffi.a \
+            stage/aarch64-apple-darwin/lib/libmst5_client_ffi.a \
+            -output dist/macos-universal/lib/libmst5_client_ffi.a
+          printf '{"abi":1,"version":"%s","target":"universal2-apple-darwin"}\n' "$version" > dist/macos-universal/manifest.json
+          tar -C dist -czf "dist/mst5-client-${version}-macos-universal.tar.gz" macos-universal
+          lipo -create \
+            stage/x86_64-apple-ios/lib/libmst5_client_ffi.a \
+            stage/aarch64-apple-ios-sim/lib/libmst5_client_ffi.a \
+            -output xc/libmst5_client_ffi-simulator.a
+          xcodebuild -create-xcframework \
+            -library stage/aarch64-apple-ios/lib/libmst5_client_ffi.a -headers ffi/include \
+            -library xc/libmst5_client_ffi-simulator.a -headers ffi/include \
+            -output "dist/MST5Client.xcframework"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/MST5Client.xcframework" "dist/mst5-client-${version}-apple-xcframework.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-apple-bundles
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish:
+    needs: [version, linux, windows, apple, apple-bundles, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: release
+      - run: |
+          cd release
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+      - env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: ./scripts/release-notes.sh "${{ needs.version.outputs.value }}" release/RELEASE_NOTES.md
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" release/* --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "v$VERSION" --notes-file release/RELEASE_NOTES.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "v$VERSION" release/* --target "$GITHUB_SHA" \
+              --title "mst5-client $VERSION" --notes-file release/RELEASE_NOTES.md --repo "$GITHUB_REPOSITORY"
+          fi
