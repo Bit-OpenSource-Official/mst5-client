@@ -27,10 +27,10 @@ The transport is native async and uses `tokio::net::TcpStream`. The crate does n
 
 ## Native releases
 
-`make release-branch 0.4.0` publishes the current clean `main` commit to
-`release/0.4.0`. GitHub Actions builds C ABI archives for Linux glibc/musl,
+`make release-branch 0.5.0` publishes the current clean `main` commit to
+`release/0.5.0`. GitHub Actions builds C ABI archives for Linux glibc/musl,
 Windows, macOS, Android and iOS and publishes them with checksums in release
-`v0.4.0`. Existing release branches are updated only by fast-forward.
+`v0.5.0`. Existing release branches are updated only by fast-forward.
 
 ## Dependencies
 

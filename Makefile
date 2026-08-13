@@ -14,7 +14,7 @@ RELEASE_VERSION := $(if $(VERSION),$(VERSION),$(RELEASE_POSITIONAL))
 help:
 	@echo "make test"
 	@echo "make ffi"
-	@echo "make release-branch 0.4.0"
+	@echo "make release-branch 0.5.0"
 
 test:
 	@cargo test --locked --lib

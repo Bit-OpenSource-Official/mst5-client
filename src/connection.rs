@@ -542,7 +542,7 @@ async fn write_frame_locked(
     frame: &Frame,
     write_timeout: Duration,
 ) -> io::Result<()> {
-    let encoded = frame.clone().encode()?;
+    let encoded = frame.encode()?;
     let record = seal_record(&mut writer.cipher, &writer.handshake_hash, 0, &encoded)?;
     io_timeout(
         write_timeout,

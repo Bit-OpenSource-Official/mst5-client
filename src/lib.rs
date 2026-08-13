@@ -17,8 +17,11 @@ use tokio::time::timeout;
 use x25519_dalek::{PublicKey, ReusableSecret};
 use zeroize::Zeroize;
 
+mod account;
 mod connection;
 pub mod e2e;
+pub mod image;
+pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
 use connection::Mst5Connection;
 
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
@@ -41,7 +44,7 @@ const MST5_FLAG_DEFLATE: u8 = 1;
 const MST5_MAX_COMPRESSION_RATIO: usize = 64;
 const TRANSPORT_MAJOR: u64 = 5;
 const RPC_MAJOR: u64 = 1;
-const RPC_MINOR: u64 = 1;
+const RPC_MINOR: u64 = 2;
 const FEATURE_MULTIPLEX: u64 = 1 << 0;
 const FEATURE_STRUCTURED_ERRORS: u64 = 1 << 1;
 const FEATURE_CBOR_QUERY: u64 = 1 << 2;
@@ -929,7 +932,24 @@ impl Client {
     }
 
     pub async fn authenticate_info(&self, token: &str) -> io::Result<AuthInfo> {
-        let payload = Value::map([("token", Value::Text(token.to_string()))]).encode_cbor();
+        self.authenticate_info_with_client_name(token, "").await
+    }
+
+    pub async fn authenticate_info_with_client_name(
+        &self,
+        token: &str,
+        client_name: &str,
+    ) -> io::Result<AuthInfo> {
+        if client_name.chars().count() > 64 {
+            return Err(invalid_input(
+                "client_name must contain at most 64 characters",
+            ));
+        }
+        let payload = Value::map([
+            ("token", Value::Text(token.to_string())),
+            ("client_name", Value::Text(client_name.trim().to_string())),
+        ])
+        .encode_cbor();
         let frame = self
             .connection
             .request(kind::AUTH, 0, [0; 16], 0, payload, self.read_timeout)
@@ -2342,7 +2362,7 @@ impl Frame {
         Ok(frame)
     }
 
-    fn encode(self) -> io::Result<Vec<u8>> {
+    fn encode(&self) -> io::Result<Vec<u8>> {
         if self.flags != 0 {
             return Err(invalid_input("client MST5 frames must not use compression"));
         }
