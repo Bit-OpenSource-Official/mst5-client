@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Validate embedded production server pin
+        if: github.event_name == 'push'
+        run: |
+          [[ -n "${CRYPT_SERVER_PUBLIC_KEY_B64:-}" ]]
+          decoded_size="$(printf '%s' "$CRYPT_SERVER_PUBLIC_KEY_B64" | base64 --decode | wc -c)"
+          [[ "$decoded_size" == 32 ]]
       - run: cargo test --locked --lib
       - run: cargo test --locked --manifest-path ffi/Cargo.toml
       - name: Native C ABI smoke
@@ -40,12 +46,6 @@ jobs:
           ffi="$(sed -n 's/^version = "\([^"]*\)"/\1/p' ffi/Cargo.toml | head -n1)"
           [[ "$version" == "$crate" && "$version" == "$ffi" ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
-      - name: Validate embedded production server pin
-        run: |
-          [[ -n "${CRYPT_SERVER_PUBLIC_KEY_B64:-}" ]]
-          decoded_size="$(printf '%s' "$CRYPT_SERVER_PUBLIC_KEY_B64" | base64 --decode | wc -c)"
-          [[ "$decoded_size" == 32 ]]
-
   linux:
     needs: [test, version]
     strategy:
