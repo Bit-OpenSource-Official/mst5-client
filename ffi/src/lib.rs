@@ -6,7 +6,6 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
@@ -29,7 +28,7 @@ thread_local! {
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 static CLIENTS: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
 static IDENTITIES: OnceLock<Mutex<HashMap<u64, Arc<Identity>>>> = OnceLock::new();
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+static NEXT_HANDLE: Mutex<u64> = Mutex::new(1);
 
 fn runtime() -> Result<&'static Runtime, String> {
     RUNTIME
@@ -97,8 +96,13 @@ unsafe fn output(out: *mut Mst5Buffer, value: Vec<u8>) -> Result<(), (i32, Strin
 }
 
 fn next_handle() -> Result<u64, (i32, String)> {
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    if handle == 0 { Err((IO_ERROR, "native handle space exhausted".to_string())) } else { Ok(handle) }
+    let mut next = NEXT_HANDLE.lock().map_err(|_| io_error("native handle registry poisoned"))?;
+    let handle = *next;
+    if handle == 0 {
+        return Err((IO_ERROR, "native handle space exhausted".to_string()));
+    }
+    *next = handle.checked_add(1).unwrap_or(0);
+    Ok(handle)
 }
 
 fn io_error(error: impl ToString) -> (i32, String) {
