@@ -117,7 +117,7 @@ fn identity(handle: u64) -> Result<Arc<Identity>, (i32, String)> {
 pub extern "C" fn mst5_abi_version() -> u32 { 1 }
 
 #[no_mangle]
-pub extern "C" fn mst5_version() -> *const c_char { b"0.4.0\0".as_ptr().cast() }
+pub extern "C" fn mst5_version() -> *const c_char { b"0.5.0\0".as_ptr().cast() }
 
 #[no_mangle]
 pub extern "C" fn mst5_last_error() -> *const c_char {
