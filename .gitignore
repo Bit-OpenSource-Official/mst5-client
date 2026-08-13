@@ -1,3 +1,4 @@
 /target/
 /android-jni/target/
 /ffi/target/
+/interop-tests/target/

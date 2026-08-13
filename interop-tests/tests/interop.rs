@@ -12,12 +12,15 @@ async fn real_server_multiplex_cancel_and_reuse() -> io::Result<()> {
     let public = PublicKey::from(&private);
     std::env::set_var("CRYPT_SERVER_PRIVATE_KEY_B64", base64(&private_bytes));
     std::env::set_var("CRYPT_SERVER_PUBLIC_KEY_B64", base64(public.as_bytes()));
+    let node_secret = format!("mst5-client-node-{}", now_ms());
+    std::env::set_var("NODE_SECRET", &node_secret);
     let address = free_address()?;
     let server_address = address.clone();
     std::thread::spawn(move || {
         micromsg::serve_async(&server_address, micromsg::App::new()).expect("interop MST5 server");
     });
     wait_for_server(&address).await?;
+    start_call_node(&address).await?;
 
     let client = Client::connect(&format!("tcp://{address}"), &base64(public.as_bytes())).await?;
     let auth = client.authenticate_info("").await?;
@@ -145,33 +148,26 @@ async fn voice_round_trip(
             Value::map([("peer", Value::from(second_username.as_str()))]),
         )
         .await?
-        .into_result()?
-        .get("ticket")
-        .and_then(Value::as_str)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing first voice ticket"))?
-        .to_string();
+        .into_result()?;
     let second_ticket = second
         .command(
             op::VOICE_TICKET,
             Value::map([("peer", Value::from(first_username))]),
         )
         .await?
-        .into_result()?
-        .get("ticket")
-        .and_then(Value::as_str)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing second voice ticket"))?
-        .to_string();
+        .into_result()?;
 
-    let first_voice =
-        Client::connect_voice(&format!("tcp://{address}"), public_key, &first_ticket).await?;
+    let (first_endpoint, first_key, first_ticket) = voice_connection(&first_ticket)?;
+    let (second_endpoint, second_key, second_ticket) = voice_connection(&second_ticket)?;
+
+    let first_voice = Client::connect_voice(&first_endpoint, &first_key, &first_ticket).await?;
     assert!(
-        Client::connect_voice(&format!("tcp://{address}"), public_key, &first_ticket)
+        Client::connect_voice(&first_endpoint, &first_key, &first_ticket)
             .await
             .is_err(),
         "voice tickets must be single-use"
     );
-    let second_voice =
-        Client::connect_voice(&format!("tcp://{address}"), public_key, &second_ticket).await?;
+    let second_voice = Client::connect_voice(&second_endpoint, &second_key, &second_ticket).await?;
     first_voice.send(b"mst5 voice frame").await?;
     let received = tokio::time::timeout(Duration::from_secs(2), second_voice.recv())
         .await
@@ -181,6 +177,49 @@ async fn voice_round_trip(
     second_voice.close().await?;
     second.close().await?;
     Ok(())
+}
+
+fn voice_connection(value: &Value) -> io::Result<(String, String, String)> {
+    let required = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("missing voice {name}"))
+            })
+    };
+    Ok((
+        required("endpoint")?,
+        required("server_public_key")?,
+        required("ticket")?,
+    ))
+}
+
+async fn start_call_node(main_address: &str) -> io::Result<()> {
+    let mut private_bytes = [0u8; 32];
+    getrandom::fill(&mut private_bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    let private = StaticSecret::from(private_bytes);
+    let public = PublicKey::from(&private);
+    let public_b64 = base64(public.as_bytes());
+    std::env::set_var("CALL_NODE_PRIVATE_KEY_B64", base64(&private_bytes));
+
+    let address = free_address()?;
+    let endpoint = format!("tcp://{address}");
+    let server_address = address.clone();
+    std::thread::spawn(move || {
+        micromsg::serve_call_node(
+            &server_address,
+            "mst5-client-interop",
+            micromsg::CallNodeHub::new(),
+        )
+        .expect("interop MST5 call node");
+    });
+    wait_for_server(&address).await?;
+    let registration = format!(
+        r#"{{"id":"mst5-client-interop","type":"call","endpoint":"{endpoint}","public_key":"{public_b64}","traffic_capacity_bps":1000000,"traffic_bps":0,"traffic_percent":0}}"#
+    );
+    micromsg::register_worker_node(&format!("tcp://{main_address}"), &registration)
 }
 
 async fn media_node_round_trip() -> io::Result<()> {
