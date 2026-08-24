@@ -20,7 +20,9 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
-const UPLOAD_CHUNK: usize = 256 * 1024;
+// GET request-targets are limited by the CDN.  Bit.Proxy uses the same safe
+// ceiling: URL-safe Base64 expands this to 31,407 bytes including the query.
+const UPLOAD_CHUNK: usize = 23 * 1024;
 // The production edge currently uses the project CA below rather than a
 // browser CA. Keep public WebPKI roots as well so independently hosted M5oH
 // domains can use ordinary public certificates.
@@ -177,25 +179,13 @@ async fn request(
 ) -> io::Result<HttpResponse> {
     let mut stream = connect(endpoint, connect_timeout).await?;
     let is_down = channel == "down";
-    let method = if is_down {
-        "GET"
-    } else {
-        match endpoint.route.as_deref() {
-            Some("file-main") => "PUT",
-            Some("call-main") => "PATCH",
-            _ => "POST",
-        }
-    };
+    let method = "GET";
     let user_agent = endpoint
         .route
         .as_deref()
         .map(|route| format!("OVE-MST5-M5oH/{route}"))
         .unwrap_or_else(|| "OVE-MST5-M5oH/1".to_string());
-    let target = endpoint
-        .route
-        .as_deref()
-        .map(|route| format!("/m5/{route}"))
-        .unwrap_or_else(|| "/".to_string());
+    let target = get_target(endpoint.route.as_deref(), payload);
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\nX-MST5-Session: {session_id}\r\nX-MST5-Channel: {channel}\r\nX-MST5-Seq: {sequence}\r\nAccept: application/octet-stream\r\nUser-Agent: {user_agent}\r\nCache-Control: no-store\r\nConnection: close\r\n",
         endpoint.host_header(),
@@ -207,12 +197,8 @@ async fn request(
         head.push_str("X-MST5-Max-Response: 8388608\r\n");
     }
     if eof { head.push_str("X-MST5-EOF: 1\r\n"); }
-    if !is_down {
-        head.push_str(&format!("Content-Type: application/octet-stream\r\nContent-Length: {}\r\n", payload.len()));
-    }
     head.push_str("\r\n");
     stream.get_mut().write_all(head.as_bytes()).await?;
-    if !payload.is_empty() { stream.get_mut().write_all(payload).await?; }
     stream.get_mut().flush().await?;
     let response = read_response(&mut stream).await?;
     if response.status != 200 {
@@ -222,6 +208,49 @@ async fn request(
         ));
     }
     Ok(response)
+}
+
+/// Bit.Proxy-compatible GET framing.  Keep the route before the payload so a
+/// shared router can choose the upstream without relying on HTTP methods.
+fn get_target(route: Option<&str>, payload: &[u8]) -> String {
+    let encoded = base64url_no_pad(payload);
+    match (route, payload.is_empty()) {
+        (Some(route), true) => format!("/?m5={route}"),
+        (Some(route), false) => format!("/?m5={route}&r={encoded}"),
+        (None, true) => "/".to_string(),
+        (None, false) => format!("/?r={encoded}"),
+    }
+}
+
+fn base64url_no_pad(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity((input.len() * 4).div_ceil(3));
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[((first & 0x03) << 4 | second >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[((second & 0x0f) << 2 | third >> 6) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_target;
+
+    #[test]
+    fn uses_bit_proxy_get_framing_with_a_route_selector() {
+        assert_eq!(get_target(Some("main"), &[]), "/?m5=main");
+        assert_eq!(get_target(Some("file-main"), &[0, 1, 2]), "/?m5=file-main&r=AAEC");
+        assert_eq!(get_target(None, &[0, 1]), "/?r=AAE");
+    }
 }
 
 async fn connect(endpoint: &Endpoint, connect_timeout: Duration) -> io::Result<BufReader<HttpStream>> {
