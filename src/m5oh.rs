@@ -20,9 +20,10 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
-// GET request-targets are limited by the CDN.  Bit.Proxy uses the same safe
-// ceiling: URL-safe Base64 expands this to 31,407 bytes including the query.
-const UPLOAD_CHUNK: usize = 23 * 1024;
+// The CDN accepts at most the 31,407-byte request-target proven by Bit.Proxy.
+// Reserve 13 bytes for `/?m5=file-main&r=` (the longest current route), so
+// URL-safe Base64 never exceeds that limit.
+const UPLOAD_CHUNK: usize = 23 * 1024 - 10;
 // The production edge currently uses the project CA below rather than a
 // browser CA. Keep public WebPKI roots as well so independently hosted M5oH
 // domains can use ordinary public certificates.
@@ -250,6 +251,12 @@ mod tests {
         assert_eq!(get_target(Some("main"), &[]), "/?m5=main");
         assert_eq!(get_target(Some("file-main"), &[0, 1, 2]), "/?m5=file-main&r=AAEC");
         assert_eq!(get_target(None, &[0, 1]), "/?r=AAE");
+    }
+
+    #[test]
+    fn routed_get_target_fits_the_cdn_limit() {
+        let target = get_target(Some("file-main"), &vec![0x5a; super::UPLOAD_CHUNK]);
+        assert_eq!(target.len(), 31_407);
     }
 }
 
