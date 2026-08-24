@@ -19,6 +19,7 @@ use zeroize::Zeroize;
 
 mod account;
 mod connection;
+mod m5oh;
 pub mod e2e;
 pub mod image;
 pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
@@ -46,6 +47,8 @@ pub fn compiled_server_public_key_b64() -> io::Result<&'static str> {
 
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
 const SERVER_MAGIC: &[u8; 4] = b"RSP5";
+const ROUTER_MAGIC: &[u8; 4] = b"M5RT";
+const ROUTER_VERSION: u8 = 1;
 const HANDSHAKE_MESSAGE_LEN: usize = 48;
 const TAG_LEN: usize = 16;
 const MAX_TRANSPORT_PAYLOAD: usize = 20 * 1024 * 1024;
@@ -205,6 +208,13 @@ pub mod op {
     pub const NOTIFYBOT_CONFIRM: u16 = 76;
     pub const NOTIFYBOT_CANCEL: u16 = 77;
     pub const NOTIFYBOT_WORK: u16 = 78;
+    pub const BOT_COMMANDS: u16 = 79;
+    pub const STICKER_PACKS: u16 = 80;
+    pub const STICKER_PACK: u16 = 81;
+    pub const STICKER_CREATE: u16 = 82;
+    pub const STICKER_PURCHASE: u16 = 83;
+    pub const STICKER_SEND: u16 = 84;
+    pub const STICKER_PRICE: u16 = 85;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -824,14 +834,42 @@ impl Client {
         pinned_public_key: [u8; 32],
         options: ClientOptions,
     ) -> io::Result<Self> {
-        let address = endpoint_address(endpoint)?;
-        let mut stream = io_timeout(
-            options.connect_timeout,
-            "MST5 connect timed out",
-            TcpStream::connect(address),
-        )
-        .await?;
+        // A configured endpoint list always tries raw MST5 first, then the
+        // independently-hosted M5oH fallback. This is deliberately handled
+        // below the public API so media, voice, and account connections share
+        // exactly the same order and pin validation.
+        if endpoint.contains('|') {
+            let mut last_error = None;
+            for candidate in endpoint.split('|').map(str::trim).filter(|value| !value.is_empty()) {
+                match Self::connect_one_with_key_and_options(candidate, pinned_public_key, options.clone()).await {
+                    Ok(client) => return Ok(client),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            return Err(last_error.unwrap_or_else(|| invalid_input("MST5 endpoint list is empty")));
+        }
+        Self::connect_one_with_key_and_options(endpoint, pinned_public_key, options).await
+    }
+
+    async fn connect_one_with_key_and_options(
+        endpoint: &str,
+        pinned_public_key: [u8; 32],
+        options: ClientOptions,
+    ) -> io::Result<Self> {
+        let endpoint = parse_endpoint(endpoint)?;
+        let mut stream = match endpoint.m5oh.as_ref() {
+            Some(endpoint) => m5oh::open_loopback_bridge(endpoint.clone(), options.connect_timeout).await?,
+            None => io_timeout(
+                options.connect_timeout,
+                "MST5 connect timed out",
+                TcpStream::connect(&endpoint.address),
+            )
+            .await?,
+        };
         stream.set_nodelay(options.nodelay)?;
+        if let Some(route) = endpoint.route.as_deref() {
+            write_router_preface(&mut stream, route, options.write_timeout).await?;
+        }
         let mut session = client_handshake(
             &mut stream,
             pinned_public_key,
@@ -972,14 +1010,31 @@ impl Client {
         token: &str,
         client_name: &str,
     ) -> io::Result<AuthInfo> {
+        self.authenticate_info_with_client_metadata(token, client_name, "").await
+    }
+
+    /// Authenticates and records both the client label and physical device model
+    /// in the server-side session. The model is informational only.
+    pub async fn authenticate_info_with_client_metadata(
+        &self,
+        token: &str,
+        client_name: &str,
+        device_model: &str,
+    ) -> io::Result<AuthInfo> {
         if client_name.chars().count() > 64 {
             return Err(invalid_input(
                 "client_name must contain at most 64 characters",
             ));
         }
+        if device_model.chars().count() > 128 || device_model.chars().any(char::is_control) {
+            return Err(invalid_input(
+                "device_model must contain at most 128 printable characters",
+            ));
+        }
         let payload = Value::map([
             ("token", Value::Text(token.to_string())),
             ("client_name", Value::Text(client_name.trim().to_string())),
+            ("device_model", Value::Text(device_model.trim().to_string())),
         ])
         .encode_cbor();
         let frame = self
@@ -1885,6 +1940,58 @@ impl Client {
             )
             .await?;
         AuthResult::from_value(&value, "reset_bot_token response")
+    }
+
+    pub async fn bot_commands(&self, bot: &str) -> io::Result<Value> {
+        let mut query = QueryBuilder::new();
+        query.push("bot", bot);
+        self.query_result(op::BOT_COMMANDS, &query.finish()).await
+    }
+
+    pub async fn sticker_packs(&self) -> io::Result<Value> {
+        self.query_result(op::STICKER_PACKS, "").await
+    }
+
+    pub async fn sticker_pack(&self, id: &str) -> io::Result<Value> {
+        let mut query = QueryBuilder::new();
+        query.push("id", id);
+        self.query_result(op::STICKER_PACK, &query.finish()).await
+    }
+
+    pub async fn create_sticker_pack(&self, body: Value) -> io::Result<Value> {
+        self.command_result(op::STICKER_CREATE, body).await
+    }
+
+    pub async fn purchase_sticker_pack(&self, id: &str) -> io::Result<Value> {
+        self.command_result(op::STICKER_PURCHASE, Value::map([("id", Value::from(id))]))
+            .await
+    }
+
+    pub async fn send_sticker(
+        &self,
+        to: &str,
+        pack_id: &str,
+        file_id: &str,
+        client_message_id: &str,
+    ) -> io::Result<Value> {
+        self.command_result(
+            op::STICKER_SEND,
+            Value::map([
+                ("to", Value::from(to)),
+                ("pack_id", Value::from(pack_id)),
+                ("file_id", Value::from(file_id)),
+                ("client_message_id", Value::from(client_message_id)),
+            ]),
+        )
+        .await
+    }
+
+    pub async fn set_sticker_pack_price(&self, id: &str, price_dsr: i64) -> io::Result<Value> {
+        self.command_result(
+            op::STICKER_PRICE,
+            Value::map([("id", Value::from(id)), ("price_dsr", Value::from(price_dsr))]),
+        )
+        .await
     }
 
     pub async fn set_e2e_key(&self, public_key_b64: &str) -> io::Result<Value> {
@@ -3253,12 +3360,38 @@ fn base64_value(byte: u8) -> io::Result<u8> {
     }
 }
 
-fn endpoint_address(endpoint: &str) -> io::Result<String> {
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedEndpoint {
+    address: String,
+    route: Option<String>,
+    m5oh: Option<m5oh::Endpoint>,
+}
+
+fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
     let value = endpoint.trim().trim_end_matches('/');
+    if let Some(address) = value.strip_prefix("m5ohs://") {
+        let (endpoint, route) = parse_m5oh_endpoint(address, 443, true)?;
+        return Ok(ParsedEndpoint { address: String::new(), route, m5oh: Some(endpoint) });
+    }
+    if let Some(address) = value.strip_prefix("m5oh://") {
+        let (endpoint, route) = parse_m5oh_endpoint(address, 80, false)?;
+        return Ok(ParsedEndpoint { address: String::new(), route, m5oh: Some(endpoint) });
+    }
     if value.starts_with("https://") || value.starts_with("tcps://") {
         return Err(invalid_input(
-            "native MST5 endpoint must use tcp://host:port",
+            "MST5 endpoint must use tcp://host:port, mst5://host:port/route, m5oh://host, or m5ohs://host",
         ));
+    }
+    if let Some(routed) = value.strip_prefix("mst5://") {
+        let (address, route) = routed
+            .split_once('/')
+            .ok_or_else(|| invalid_input("routed MST5 endpoint is missing route ID"))?;
+        validate_route_id(route)?;
+        return Ok(ParsedEndpoint {
+            address: endpoint_socket_address(address, 8067)?,
+            route: Some(route.to_string()),
+            m5oh: None,
+        });
     }
     let value = value
         .strip_prefix("tcp://")
@@ -3267,18 +3400,96 @@ fn endpoint_address(endpoint: &str) -> io::Result<String> {
     if value.is_empty() || value.contains('/') {
         return Err(invalid_input("invalid MST5 endpoint"));
     }
+    Ok(ParsedEndpoint {
+        address: endpoint_socket_address(value, 8080)?,
+        route: None,
+        m5oh: None,
+    })
+}
+
+fn parse_m5oh_endpoint(value: &str, default_port: u16, tls: bool) -> io::Result<(m5oh::Endpoint, Option<String>)> {
+    let (address, route) = match value.split_once('/') {
+        Some((address, route)) => {
+            validate_route_id(route)?;
+            (address, Some(route.to_string()))
+        }
+        None => (value, None),
+    };
+    if address.is_empty() || address.contains('/') || address.chars().any(|value| value.is_whitespace() || value.is_control()) {
+        return Err(invalid_input("invalid M5oH endpoint"));
+    }
+    let (host, port) = if let Some(inner) = address.strip_prefix('[') {
+        let (host, port) = inner
+            .split_once(']')
+            .ok_or_else(|| invalid_input("invalid M5oH IPv6 endpoint"))?;
+        let port = match port.strip_prefix(':') {
+            Some(port) if !port.is_empty() => port.parse::<u16>().map_err(|_| invalid_input("invalid M5oH endpoint port"))?,
+            None => default_port,
+            _ => return Err(invalid_input("invalid M5oH IPv6 endpoint")),
+        };
+        (host.to_string(), port)
+    } else if let Some((host, port)) = address.rsplit_once(':') {
+        if host.contains(':') {
+            return Err(invalid_input("M5oH IPv6 endpoints must use brackets"));
+        }
+        (host.to_string(), port.parse::<u16>().map_err(|_| invalid_input("invalid M5oH endpoint port"))?)
+    } else {
+        (address.to_string(), default_port)
+    };
+    if host.is_empty() || port == 0 {
+        return Err(invalid_input("invalid M5oH endpoint"));
+    }
+    Ok((m5oh::Endpoint { host, port, tls, route: route.clone() }, route))
+}
+
+fn endpoint_socket_address(value: &str, default_port: u16) -> io::Result<String> {
+    if value.is_empty() || value.contains('/') {
+        return Err(invalid_input("invalid MST5 endpoint address"));
+    }
     if value.starts_with('[') {
         return Ok(if value.contains("]:") {
             value.to_string()
         } else {
-            format!("{value}:8080")
+            format!("{value}:{default_port}")
         });
     }
     Ok(if value.rsplit_once(':').is_some() {
         value.to_string()
     } else {
-        format!("{value}:8080")
+        format!("{value}:{default_port}")
     })
+}
+
+fn validate_route_id(route: &str) -> io::Result<()> {
+    let valid = !route.is_empty()
+        && route.len() <= 63
+        && route.as_bytes()[0].is_ascii_lowercase()
+        && route.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        });
+    if !valid {
+        return Err(invalid_input("invalid MST5 route ID"));
+    }
+    Ok(())
+}
+
+async fn write_router_preface(
+    stream: &mut TcpStream,
+    route: &str,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    validate_route_id(route)?;
+    let mut preface = Vec::with_capacity(6 + route.len());
+    preface.extend_from_slice(ROUTER_MAGIC);
+    preface.push(ROUTER_VERSION);
+    preface.push(route.len() as u8);
+    preface.extend_from_slice(route.as_bytes());
+    io_timeout(
+        write_timeout,
+        "MST5 router preface timed out",
+        stream.write_all(&preface),
+    )
+    .await
 }
 
 fn required_field<'a>(value: &'a Value, key: &str, context: &str) -> io::Result<&'a Value> {
@@ -3507,6 +3718,49 @@ mod tests {
         query.push("peer", "@alice");
         query.push_i64("after", 42);
         assert_eq!(query.finish(), "peer=%40alice&after=42");
+    }
+
+    #[test]
+    fn parses_direct_and_routed_endpoints() {
+        assert_eq!(
+            parse_endpoint("tcp://ms.ove.rs:8080").unwrap(),
+            ParsedEndpoint {
+                address: "ms.ove.rs:8080".to_string(),
+                route: None,
+                m5oh: None,
+            }
+        );
+        assert_eq!(
+            parse_endpoint("mst5://ms.ove.rs:8067/file-main").unwrap(),
+            ParsedEndpoint {
+                address: "ms.ove.rs:8067".to_string(),
+                route: Some("file-main".to_string()),
+                m5oh: None,
+            }
+        );
+        assert!(parse_endpoint("mst5://ms.ove.rs:8067/MEDIA").is_err());
+        assert!(parse_endpoint("mst5://ms.ove.rs:8067").is_err());
+        assert_eq!(
+            parse_endpoint("m5ohs://m5oh.ms.ove.rs").unwrap(),
+            ParsedEndpoint {
+                address: String::new(),
+                route: None,
+                m5oh: Some(m5oh::Endpoint { host: "m5oh.ms.ove.rs".to_string(), port: 443, tls: true, route: None }),
+            }
+        );
+        assert_eq!(
+            parse_endpoint("m5oh://central-1-cdn.ms.sectorlambda.ru/main").unwrap(),
+            ParsedEndpoint {
+                address: String::new(),
+                route: Some("main".to_string()),
+                m5oh: Some(m5oh::Endpoint {
+                    host: "central-1-cdn.ms.sectorlambda.ru".to_string(),
+                    port: 80,
+                    tls: false,
+                    route: Some("main".to_string()),
+                }),
+            }
+        );
     }
 
     fn hex(bytes: &[u8]) -> String {

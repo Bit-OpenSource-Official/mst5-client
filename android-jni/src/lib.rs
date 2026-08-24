@@ -155,12 +155,15 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
     _class: JClass<'_>,
     endpoint: JString<'_>,
     public_key: JString<'_>,
+    device_model: JString<'_>,
 ) -> jlong {
     let result = (|| -> Result<i64, String> {
         let endpoint = java_string(&mut env, endpoint)?;
         let supplied_public_key = java_string(&mut env, public_key)?;
+        let device_model = java_string(&mut env, device_model)?;
         let public_key = compiled_server_public_key_b64().unwrap_or(&supplied_public_key);
-        let mut config = AccountConfig::new(endpoint, public_key, "", "OVE.rs Android");
+        let mut config = AccountConfig::new(endpoint, public_key, "", "OVE.rs Android")
+            .with_device_model(device_model);
         config.options.read_timeout = Duration::from_secs(120);
         config.options.write_timeout = Duration::from_secs(30);
         let account = AccountClient::new(config).map_err(|error| error.to_string())?;
@@ -658,9 +661,12 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUpload(
         let file = duplicate_file(fd)?;
         let mut source = ProgressReader {
             inner: tokio::fs::File::from_std(file),
-            progress,
+            progress: progress.clone(),
             completed: 0,
         };
+        if let Some(progress) = &progress {
+            progress.update(0).map_err(|error| error.to_string())?;
+        }
         runtime()?
             .block_on(async {
                 let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
@@ -730,6 +736,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadBatch(
             .ok_or_else(|| "media batch total size overflow".to_string())?;
         let progress = JavaProgress::new(&mut env, observer, total)?;
         let progress = progress.ok_or_else(|| "media batch observer is required".to_string())?;
+        progress.update(0).map_err(|error| error.to_string())?;
         let files = fds_raw
             .into_iter()
             .map(duplicate_file)

@@ -11,6 +11,8 @@ pub struct AccountConfig {
     pub pinned_public_key_b64: String,
     pub token: String,
     pub client_name: String,
+    /// Human-readable device model attached to the authenticated session.
+    pub device_model: String,
     pub options: ClientOptions,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
@@ -28,10 +30,16 @@ impl AccountConfig {
             pinned_public_key_b64: pinned_public_key_b64.into(),
             token: token.into(),
             client_name: client_name.into(),
+            device_model: String::new(),
             options: ClientOptions::default(),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(60),
         }
+    }
+
+    pub fn with_device_model(mut self, device_model: impl Into<String>) -> Self {
+        self.device_model = device_model.into();
+        self
     }
 
     /// Create an account reactor configuration using the pin embedded in the
@@ -84,7 +92,7 @@ pub struct AccountClient {
 
 struct AccountInner {
     config: AccountConfig,
-    credentials: RwLock<(String, String)>,
+    credentials: RwLock<(String, String, String)>,
     current: RwLock<Option<(u64, Client)>>,
     connect_lock: Mutex<()>,
     generation: AtomicU32,
@@ -106,7 +114,17 @@ impl AccountClient {
                 "client_name must contain at most 64 characters",
             ));
         }
-        let credentials = (config.token.clone(), config.client_name.clone());
+        if config.device_model.chars().count() > 128 || config.device_model.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device_model must contain at most 128 printable characters",
+            ));
+        }
+        let credentials = (
+            config.token.clone(),
+            config.client_name.clone(),
+            config.device_model.trim().to_string(),
+        );
         let (events, _) = broadcast::channel(128);
         Ok(Self {
             inner: Arc::new(AccountInner {
@@ -142,7 +160,7 @@ impl AccountClient {
                 .map_err(|_| io::Error::other("MST5 account credentials lock poisoned"))?;
             let changed = credentials.0 != token || credentials.1 != client_name.trim();
             if changed {
-                *credentials = (token.to_string(), client_name.trim().to_string());
+                *credentials = (token.to_string(), client_name.trim().to_string(), credentials.2.clone());
             }
             changed
         };
@@ -264,14 +282,14 @@ impl AccountClient {
             self.inner.config.options.clone(),
         )
         .await?;
-        let (token, client_name) = self
+        let (token, client_name, device_model) = self
             .inner
             .credentials
             .read()
             .map_err(|_| io::Error::other("MST5 account credentials lock poisoned"))?
             .clone();
         client
-            .authenticate_info_with_client_name(&token, &client_name)
+            .authenticate_info_with_client_metadata(&token, &client_name, &device_model)
             .await?;
         let generation = u64::from(self.inner.generation.fetch_add(1, Ordering::AcqRel) + 1);
         *self

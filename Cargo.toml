@@ -15,7 +15,10 @@ miniz_oxide = "0.9.1"
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.6.1"
 sha2 = { version = "0.10.9", default-features = false }
-tokio = { version = "1.47", default-features = false, features = ["net", "io-util", "time", "rt", "sync"] }
+tokio = { version = "1.47", default-features = false, features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26.4", default-features = false }
+webpki-roots = "0.26.11"
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["getrandom", "reusable_secrets", "static_secrets", "zeroize"] }
 zeroize = { version = "1.8.1", default-features = false, features = ["alloc"] }
 
