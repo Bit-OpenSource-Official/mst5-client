@@ -6,6 +6,7 @@ output_dir="${1:-${script_dir}/../../android-client/app/src/main/assets/mst5-nat
 cabi_output_dir="${2:-}"
 ndk_root="${ANDROID_NDK_R14_HOME:-}"
 toolchain="${ARMV6_ANDROID_TOOLCHAIN:-${script_dir}/target/android-api9-arm-toolchain}"
+target_dir="${CARGO_TARGET_DIR:-${script_dir}/target}"
 
 if [[ -z "${ndk_root}" || ! -f "${ndk_root}/build/tools/make_standalone_toolchain.py" ]]; then
   echo "Set ANDROID_NDK_R14_HOME to an extracted Android NDK r14b directory." >&2
@@ -31,11 +32,13 @@ env \
   RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=arm1176jzf-s -C panic=abort -L native=${unwind_dir}" \
   rustup run nightly cargo -Z build-std=std,panic_abort build \
     --manifest-path "${script_dir}/Cargo.toml" \
+    --target-dir "${target_dir}" \
+    --no-default-features \
     --release \
     --target arm-linux-androideabi
 
 mkdir -p "${output_dir}/armeabi"
-cp "${script_dir}/target/arm-linux-androideabi/release/libmst5_android.so" \
+cp "${target_dir}/arm-linux-androideabi/release/libmst5_android.so" \
   "${output_dir}/armeabi/libmst5_android.so"
 "${toolchain}/bin/arm-linux-androideabi-strip" --strip-unneeded \
   "${output_dir}/armeabi/libmst5_android.so"
@@ -57,10 +60,12 @@ if [[ -n "${cabi_output_dir}" ]]; then
     RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=arm1176jzf-s -C panic=abort -L native=${unwind_dir}" \
     rustup run nightly cargo -Z build-std=std,panic_abort build \
       --manifest-path "${script_dir}/../ffi/Cargo.toml" \
+      --target-dir "${target_dir}" \
+      --no-default-features \
       --release \
       --target arm-linux-androideabi
   mkdir -p "${cabi_output_dir}/armeabi"
-  cp "${script_dir}/../ffi/target/arm-linux-androideabi/release/libmst5_client_ffi.so" \
+  cp "${target_dir}/arm-linux-androideabi/release/libmst5_client_ffi.so" \
     "${cabi_output_dir}/armeabi/libmst5_client_ffi.so"
   "${toolchain}/bin/arm-linux-androideabi-strip" --strip-unneeded \
     "${cabi_output_dir}/armeabi/libmst5_client_ffi.so"

@@ -5,17 +5,21 @@
 //! from MST5.  A short-lived loopback TCP connection lets the rest of the
 //! client keep the same audited Noise and frame implementation as raw MST5.
 
+#[cfg(feature = "m5oh-tls")]
 use rustls::{ClientConfig, RootCertStore};
+#[cfg(feature = "m5oh-tls")]
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+#[cfg(feature = "m5oh-tls")]
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream};
 use tokio::time::timeout;
+#[cfg(feature = "m5oh-tls")]
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
 const MAX_HTTP_HEAD: usize = 64 * 1024;
@@ -51,6 +55,7 @@ impl Endpoint {
 
 enum HttpStream {
     Plain(TcpStream),
+    #[cfg(feature = "m5oh-tls")]
     Tls(TlsStream<TcpStream>),
 }
 
@@ -58,6 +63,7 @@ impl AsyncRead for HttpStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "m5oh-tls")]
             Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
@@ -67,6 +73,7 @@ impl AsyncWrite for HttpStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "m5oh-tls")]
             Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
@@ -74,6 +81,7 @@ impl AsyncWrite for HttpStream {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "m5oh-tls")]
             Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
@@ -81,6 +89,7 @@ impl AsyncWrite for HttpStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "m5oh-tls")]
             Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
@@ -267,17 +276,26 @@ async fn connect(endpoint: &Endpoint, connect_timeout: Duration) -> io::Result<B
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH HTTP connect timed out"))??;
     stream.set_nodelay(true)?;
     if !endpoint.tls { return Ok(BufReader::new(HttpStream::Plain(stream))); }
-    let roots = m5oh_roots()?;
-    let config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let name = ServerName::try_from(endpoint.host.clone())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid M5oH TLS hostname"))?;
-    let connector = TlsConnector::from(Arc::new(config));
-    let stream = timeout(connect_timeout, connector.connect(name, stream))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH TLS handshake timed out"))??;
-    Ok(BufReader::new(HttpStream::Tls(stream)))
+    #[cfg(feature = "m5oh-tls")]
+    {
+        let roots = m5oh_roots()?;
+        let config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let name = ServerName::try_from(endpoint.host.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid M5oH TLS hostname"))?;
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = timeout(connect_timeout, connector.connect(name, stream))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH TLS handshake timed out"))??;
+        return Ok(BufReader::new(HttpStream::Tls(stream)));
+    }
+    #[cfg(not(feature = "m5oh-tls"))]
+    {
+        let _ = stream;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "M5oH HTTPS is unavailable in this build"))
+    }
 }
 
+#[cfg(feature = "m5oh-tls")]
 fn m5oh_roots() -> io::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

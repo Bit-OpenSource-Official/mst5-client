@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 jni = "0.21.1"
 libc = "0.2"
-mst5-client = { path = ".." }
+mst5-client = { path = "..", default-features = false }
 tokio = { version = "1.47", features = ["fs", "rt-multi-thread"] }
 
 [build-dependencies]

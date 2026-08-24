@@ -5,11 +5,15 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = ["m5oh-tls"]
+m5oh-tls = ["mst5-client/m5oh-tls"]
+
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-mst5-client = { path = ".." }
+mst5-client = { path = "..", default-features = false }
 tokio = { version = "1.47", features = ["rt-multi-thread"] }
 zeroize = { version = "1.8.1", default-features = false, features = ["alloc"] }
 
