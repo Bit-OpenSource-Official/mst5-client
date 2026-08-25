@@ -2,12 +2,12 @@ use jni::objects::{
     GlobalRef, JByteArray, JByteBuffer, JClass, JIntArray, JLongArray, JObject, JObjectArray,
     JString, JValue,
 };
-use jni::sys::{jboolean, jbyteArray, jint, jlong, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore};
+use mst5_client::messenger::{MessengerConfig, MessengerCore, SessionStorage, TransportMode};
 use mst5_client::{
-    compiled_server_public_key_b64, AccountClient, AccountConfig, Client, RequestOptions,
-    VoiceStream,
+    compiled_server_public_key_b64, Client, RequestOptions, VoiceStream,
 };
 use std::collections::HashMap;
 use std::io;
@@ -16,15 +16,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 
-const BRIDGE_VERSION: jint = 3;
+const BRIDGE_VERSION: jint = 4;
 
 struct NativeClient {
-    account: AccountClient,
+    messenger: MessengerCore,
 }
 
 static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
@@ -35,6 +34,7 @@ static NEXT_VOICE: AtomicI32 = AtomicI32::new(1);
 static IDENTITIES: OnceLock<Mutex<HashMap<i64, Arc<Identity>>>> = OnceLock::new();
 static NEXT_IDENTITY: AtomicI32 = AtomicI32::new(1);
 static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
+static SESSION_STORAGE: OnceLock<Mutex<Option<SessionStorage>>> = OnceLock::new();
 
 fn runtime() -> Result<&'static Runtime, String> {
     RUNTIME
@@ -60,6 +60,10 @@ fn voices() -> &'static Mutex<HashMap<i64, Arc<VoiceStream>>> {
 
 fn identities() -> &'static Mutex<HashMap<i64, Arc<Identity>>> {
     IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_storage() -> &'static Mutex<Option<SessionStorage>> {
+    SESSION_STORAGE.get_or_init(|| Mutex::new(None))
 }
 
 fn identity(handle: jlong) -> Result<Arc<Identity>, String> {
@@ -149,6 +153,88 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVersion(
     BRIDGE_VERSION
 }
 
+/// Opens the persistent messenger state once the Android application supplies
+/// its private files directory.  Legacy Java properties are imported by the
+/// platform adapter on first use; Rust owns every write thereafter.
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpenSessionStore(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    root: JString<'_>,
+) -> jboolean {
+    let result = (|| -> Result<(), String> {
+        let root = java_string(&mut env, root)?;
+        let store = SessionStorage::open(root).map_err(|error| error.to_string())?;
+        *session_storage()
+            .lock()
+            .map_err(|_| "MST5 session storage lock is poisoned".to_string())? = Some(store);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            throw_io(&mut env, error);
+            JNI_FALSE
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeSessionSnapshot(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let values = session_storage()
+            .lock()
+            .map_err(|_| "MST5 session storage lock is poisoned".to_string())?;
+        values
+            .as_ref()
+            .ok_or_else(|| "MST5 session storage is not initialized".to_string())?
+            .snapshot_json()
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(snapshot) => match env.new_string(snapshot) {
+            Ok(value) => value.into_raw(),
+            Err(error) => {
+                throw_io(&mut env, format!("cannot create session snapshot: {error}"));
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeReplaceSession(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    raw: JString<'_>,
+) -> jboolean {
+    let result = (|| -> Result<(), String> {
+        let raw = java_string(&mut env, raw)?;
+        let mut values = session_storage()
+            .lock()
+            .map_err(|_| "MST5 session storage lock is poisoned".to_string())?;
+        values
+            .as_mut()
+            .ok_or_else(|| "MST5 session storage is not initialized".to_string())?
+            .replace_json(&raw)
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            throw_io(&mut env, error);
+            JNI_FALSE
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
     mut env: JNIEnv<'_>,
@@ -156,17 +242,21 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
     endpoint: JString<'_>,
     public_key: JString<'_>,
     device_model: JString<'_>,
+    transport_mode: JString<'_>,
 ) -> jlong {
     let result = (|| -> Result<i64, String> {
         let endpoint = java_string(&mut env, endpoint)?;
         let supplied_public_key = java_string(&mut env, public_key)?;
         let device_model = java_string(&mut env, device_model)?;
+        let transport_mode = java_string(&mut env, transport_mode)?;
         let public_key = compiled_server_public_key_b64().unwrap_or(&supplied_public_key);
-        let mut config = AccountConfig::new(endpoint, public_key, "", "OVE.rs Android")
-            .with_device_model(device_model);
-        config.options.read_timeout = Duration::from_secs(120);
-        config.options.write_timeout = Duration::from_secs(30);
-        let account = AccountClient::new(config).map_err(|error| error.to_string())?;
+        let messenger = MessengerCore::new(MessengerConfig::new(
+            endpoint,
+            public_key,
+            device_model,
+            TransportMode::parse(&transport_mode),
+        ))
+        .map_err(|error| error.to_string())?;
         let handle = i64::from(NEXT_CLIENT.fetch_add(1, Ordering::Relaxed));
         if handle <= 0 {
             return Err("MST5 native connection ID exhausted".to_string());
@@ -174,7 +264,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
         clients()
             .lock()
             .map_err(|_| "MST5 client registry is poisoned".to_string())?
-            .insert(handle, Arc::new(NativeClient { account }));
+            .insert(handle, Arc::new(NativeClient { messenger }));
         Ok(handle)
     })();
     match result {
@@ -198,7 +288,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeClose(
         .and_then(|mut values| values.remove(&handle));
     if let Some(value) = removed {
         if let Ok(runtime) = runtime() {
-            if let Err(error) = runtime.block_on(value.account.close()) {
+            if let Err(error) = runtime.block_on(value.messenger.close()) {
                 throw_io(&mut env, error);
             }
         }
@@ -227,9 +317,6 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeCall(
         }
         let token = java_string(&mut env, token)?;
         let connection = client(handle)?;
-        runtime()?
-            .block_on(connection.account.set_credentials(&token, "OVE.rs Android"))
-            .map_err(|error| error.to_string())?;
         let input_capacity = env
             .get_direct_buffer_capacity(&input)
             .map_err(|error| format!("invalid direct MST5 input buffer: {error}"))?;
@@ -243,7 +330,8 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeCall(
         let payload = unsafe { std::slice::from_raw_parts(input_address, input_len) };
         let deadline_ms = unix_now_ms().saturating_add(timeout_ms.max(1) as u64);
         let response = runtime()?
-            .block_on(connection.account.request_cbor(
+            .block_on(connection.messenger.request_cbor(
+                &token,
                 frame_kind as u8,
                 opcode as u16,
                 payload,
@@ -279,6 +367,38 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeCall(
         Err(error) => {
             throw_io(&mut env, error);
             -1
+        }
+    }
+}
+
+/// JSON command/event bridge used by the Android presentation layer.  The
+/// Rust core owns endpoint selection, method-to-opcode routing and canonical
+/// CBOR encoding; managed code only transfers a serializable view model.
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeCommandJson(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    command: JString<'_>,
+) -> jstring {
+    let result = (|| -> Result<String, String> {
+        let command = java_string(&mut env, command)?;
+        let connection = client(handle)?;
+        runtime()?
+            .block_on(connection.messenger.command_json(&command))
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(response) => match env.new_string(response) {
+            Ok(value) => value.into_raw(),
+            Err(error) => {
+                throw_io(&mut env, format!("cannot create messenger JSON response: {error}"));
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
         }
     }
 }

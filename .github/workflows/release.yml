@@ -157,7 +157,7 @@ jobs:
       - run: |
           cp -r ffi/include dist/android/
           version="${{ needs.version.outputs.value }}"
-          printf '{"abi":1,"android_jni_abi":3,"version":"%s","target":"android"}\n' "$version" > dist/android/manifest.json
+          printf '{"abi":1,"android_jni_abi":4,"version":"%s","target":"android"}\n' "$version" > dist/android/manifest.json
           tar -C dist -czf "dist/mst5-client-${version}-android.tar.gz" android
           for spec in armv6:armeabi armv7:armeabi-v7a arm64:arm64-v8a x86_64:x86_64; do
             label="${spec%%:*}"
@@ -166,7 +166,7 @@ jobs:
             mkdir -p "$root/include" "$root/lib"
             cp ffi/include/mst5.h "$root/include/"
             cp "dist/android/cabi/${abi}/libmst5_client_ffi.so" "$root/lib/"
-            printf '{"abi":1,"android_jni_abi":3,"version":"%s","target":"android-%s"}\n' "$version" "$label" > "$root/manifest.json"
+            printf '{"abi":1,"android_jni_abi":4,"version":"%s","target":"android-%s"}\n' "$version" "$label" > "$root/manifest.json"
             tar -C dist -czf "dist/mst5-client-${version}-android-${label}.tar.gz" "android-${label}"
           done
       - uses: actions/upload-artifact@v4
