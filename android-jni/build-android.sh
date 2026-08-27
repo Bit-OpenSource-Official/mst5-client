@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 output_dir="${1:-${script_dir}/../../android-client/app/src/main/assets/mst5-native}"
 cabi_output_dir="${2:-}"
+requested_abi="${3:-all}"
 ndk_root="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-sdk/ndk/29.0.14206865}}"
 toolchain="${ndk_root}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 target_dir="${CARGO_TARGET_DIR:-${script_dir}/target}"
@@ -47,22 +48,25 @@ build_target() {
   fi
 }
 
-build_target \
-  aarch64-linux-android \
-  arm64-v8a \
-  aarch64-linux-android21-clang \
-  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
-
-build_target \
-  armv7-linux-androideabi \
-  armeabi-v7a \
-  armv7a-linux-androideabi21-clang \
-  CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER
-
-build_target \
-  x86_64-linux-android \
-  x86_64 \
-  x86_64-linux-android21-clang \
-  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER
+case "${requested_abi}" in
+  all)
+    build_target aarch64-linux-android arm64-v8a aarch64-linux-android21-clang CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+    build_target armv7-linux-androideabi armeabi-v7a armv7a-linux-androideabi21-clang CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER
+    build_target x86_64-linux-android x86_64 x86_64-linux-android21-clang CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER
+    ;;
+  arm64)
+    build_target aarch64-linux-android arm64-v8a aarch64-linux-android21-clang CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+    ;;
+  armv7)
+    build_target armv7-linux-androideabi armeabi-v7a armv7a-linux-androideabi21-clang CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER
+    ;;
+  x86_64)
+    build_target x86_64-linux-android x86_64 x86_64-linux-android21-clang CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER
+    ;;
+  *)
+    echo "Usage: $0 [output-dir] [c-abi-output-dir] [all|arm64|armv7|x86_64]" >&2
+    exit 2
+    ;;
+esac
 
 echo "MST5 Android libraries written to ${output_dir}"

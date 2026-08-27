@@ -14,7 +14,7 @@ if [[ -z "${ndk_root}" || ! -f "${ndk_root}/build/tools/make_standalone_toolchai
 fi
 
 if [[ ! -x "${toolchain}/bin/arm-linux-androideabi-gcc" ]]; then
-  python "${ndk_root}/build/tools/make_standalone_toolchain.py" \
+  python3 "${ndk_root}/build/tools/make_standalone_toolchain.py" \
     --arch arm \
     --api 9 \
     --install-dir "${toolchain}"

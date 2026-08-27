@@ -136,25 +136,63 @@ jobs:
           name: native-${{ matrix.target }}
           path: dist/*.tar.gz
 
-  android:
+  android-build:
     needs: [test, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: armv6
+            target: arm-linux-androideabi
+          - label: armv7
+            target: armv7-linux-androideabi
+          - label: arm64
+            target: aarch64-linux-android
+          - label: x86_64
+            target: x86_64-linux-android
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,arm-linux-androideabi
+          targets: ${{ matrix.target }}
       - uses: android-actions/setup-android@v3
       - run: sdkmanager "ndk;26.3.11579264"
-      - run: |
+      - name: Install Android NDK r14 for ARMv6
+        if: matrix.label == 'armv6'
+        run: |
           curl -fsSL -o "$RUNNER_TEMP/ndk-r14b.zip" https://dl.google.com/android/repository/android-ndk-r14b-linux-x86_64.zip
           unzip -q "$RUNNER_TEMP/ndk-r14b.zip" -d "$RUNNER_TEMP"
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_R14_HOME=$RUNNER_TEMP/android-ndk-r14b" >> "$GITHUB_ENV"
-      - run: ./android-jni/build-android.sh "$PWD/dist/android/assets/mst5-native" "$PWD/dist/android/cabi"
-      - run: ./android-jni/build-armv6.sh "$PWD/dist/android/assets/mst5-native" "$PWD/dist/android/cabi"
-      - run: |
+      - name: Build native libraries
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/26.3.11579264"
+          if [[ "${{ matrix.label }}" == armv6 ]]; then
+            ./android-jni/build-armv6.sh "$PWD/out/native" "$PWD/out/cabi"
+          else
+            ./android-jni/build-android.sh "$PWD/out/native" "$PWD/out/cabi" "${{ matrix.label }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-stage-${{ matrix.label }}
+          path: out/
+
+  android:
+    needs: [version, android-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: android-stage-*
+          merge-multiple: true
+          path: input
+      - name: Package Android archives
+        run: |
+          mkdir -p dist/android/assets/mst5-native dist/android/cabi
+          cp -r input/native/. dist/android/assets/mst5-native/
+          cp -r input/cabi/. dist/android/cabi/
           cp -r ffi/include dist/android/
           version="${{ needs.version.outputs.value }}"
           printf '{"abi":1,"android_jni_abi":7,"version":"%s","target":"android"}\n' "$version" > dist/android/manifest.json
