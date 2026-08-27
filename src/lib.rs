@@ -3256,8 +3256,12 @@ fn transport_plaintext_into(
 }
 
 fn parse_transport_plaintext(plaintext: &[u8]) -> io::Result<Record> {
-    if plaintext.len() < LARGE_PADDING_BLOCK || !plaintext.len().is_multiple_of(LARGE_PADDING_BLOCK)
-    {
+    // The padding policy has changed between released MST5 versions.  A
+    // record is encrypted and authenticated before it gets here, while the
+    // payload length and the all-zero tail are checked below, so requiring a
+    // particular padding block on receipt buys no integrity.  Accepting a
+    // legacy block size keeps upgrades wire-compatible.
+    if plaintext.len() < 5 {
         return Err(invalid_data("invalid MST5 transport padding length"));
     }
     let content_type = plaintext[0];
@@ -3944,6 +3948,19 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_accepts_legacy_padding_block() {
+        let mut plaintext = vec![0u8; 64];
+        plaintext[0] = 0;
+        plaintext[1..5].copy_from_slice(&2u32.to_be_bytes());
+        plaintext[5..7].copy_from_slice(b"ok");
+
+        assert!(matches!(
+            parse_transport_plaintext(&plaintext).unwrap(),
+            Record::Application(payload) if payload == b"ok"
+        ));
+    }
 
     #[test]
     fn sha256_known_vector() {

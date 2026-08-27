@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-android"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "cc",
  "jni",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-client"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "argon2",
  "bytes",
