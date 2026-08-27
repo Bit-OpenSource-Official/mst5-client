@@ -137,6 +137,20 @@ fn duplicate_file(fd: jint) -> Result<std::fs::File, String> {
     Ok(unsafe { std::fs::File::from_raw_fd(owned_fd) })
 }
 
+/// Android's `Bitmap.copyPixelsFromBuffer` expects RGBA bytes.  A Rust u32
+/// written as 0xAARRGGBB has BGRA byte order on every supported Android ABI,
+/// so copying the words verbatim swaps red and blue in image previews.
+unsafe fn copy_argb_as_android_rgba(pixels: &[u32], output: *mut u8) {
+    for (index, pixel) in pixels.iter().enumerate() {
+        let [blue, green, red, alpha] = pixel.to_le_bytes();
+        let destination = output.add(index * 4);
+        destination.write(red);
+        destination.add(1).write(green);
+        destination.add(2).write(blue);
+        destination.add(3).write(alpha);
+    }
+}
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,7 +453,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDecodeImageFd(
             .get_direct_buffer_address(&output)
             .map_err(|error| format!("invalid direct image output buffer: {error}"))?;
         unsafe {
-            std::ptr::copy_nonoverlapping(decoded.argb.as_ptr().cast::<u8>(), address, required);
+            copy_argb_as_android_rgba(&decoded.argb, address);
         }
         Ok((u64::from(decoded.width) << 32) | u64::from(decoded.height))
     })();
@@ -498,11 +512,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDecodeImage(
             .get_direct_buffer_address(&output)
             .map_err(|error| format!("invalid direct image output buffer: {error}"))?;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                decoded.argb.as_ptr().cast::<u8>(),
-                output_address,
-                required,
-            );
+            copy_argb_as_android_rgba(&decoded.argb, output_address);
         }
         Ok((u64::from(decoded.width) << 32) | u64::from(decoded.height))
     })();
