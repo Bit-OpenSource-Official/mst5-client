@@ -1,4 +1,4 @@
-use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore, BACKUP_VERSION, ENVELOPE_VERSION};
+use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore, BACKUP_VERSION, ENVELOPE_VERSION, LEGACY_ENVELOPE_VERSION};
 use mst5_client::{compiled_server_public_key_b64, Client, RequestOptions};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -280,7 +280,9 @@ fn encode_envelope(value: &Envelope) -> Vec<u8> {
 }
 
 fn decode_envelope(value: &[u8]) -> Result<Envelope, (i32, String)> {
-    if value.len() < 41 || value[0] != ENVELOPE_VERSION { return Err((INVALID_ARGUMENT, "invalid E2E envelope".to_string())); }
+    if value.len() < 41 || !matches!(value[0], LEGACY_ENVELOPE_VERSION | ENVELOPE_VERSION) {
+        return Err((INVALID_ARGUMENT, "unsupported E2E envelope".to_string()));
+    }
     Ok(Envelope { version: value[0], nonce: value[1..25].try_into().unwrap(), ciphertext: value[25..].to_vec() })
 }
 

@@ -4,11 +4,11 @@ use jni::objects::{
 };
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
-use mst5_client::e2e::{Backup, Envelope, Identity, IdentityStore};
-use mst5_client::messenger::{MessengerConfig, MessengerCore, SessionStorage, TransportMode};
-use mst5_client::{
-    compiled_server_public_key_b64, Client, RequestOptions, VoiceStream,
+use mst5_client::e2e::{
+    Backup, Envelope, Identity, IdentityStore, ENVELOPE_VERSION, LEGACY_ENVELOPE_VERSION,
 };
+use mst5_client::messenger::{MessengerConfig, MessengerCore, SessionStorage, TransportMode};
+use mst5_client::{compiled_server_public_key_b64, Client, RequestOptions, VoiceStream};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::FromRawFd;
@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::Runtime;
 
-const BRIDGE_VERSION: jint = 4;
+const BRIDGE_VERSION: jint = 7;
 
 struct NativeClient {
     messenger: MessengerCore,
@@ -392,7 +392,10 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeCommandJson(
         Ok(response) => match env.new_string(response) {
             Ok(value) => value.into_raw(),
             Err(error) => {
-                throw_io(&mut env, format!("cannot create messenger JSON response: {error}"));
+                throw_io(
+                    &mut env,
+                    format!("cannot create messenger JSON response: {error}"),
+                );
                 std::ptr::null_mut()
             }
         },
@@ -508,6 +511,38 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDecodeImage(
         Err(error) => {
             throw_io(&mut env, error);
             0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativePrepareWebp(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    input: JByteArray<'_>,
+    max_side: jint,
+    square: jboolean,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        let input = java_bytes(&mut env, input)?;
+        mst5_client::image::prepare_webp(&input, max_side.max(1) as u32, square != JNI_FALSE)
+            .map(|prepared| prepared.bytes)
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(bytes) => match env.byte_array_from_slice(&bytes) {
+            Ok(value) => value.into_raw(),
+            Err(error) => {
+                throw_io(
+                    &mut env,
+                    format!("cannot allocate WebP byte array: {error}"),
+                );
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
         }
     }
 }
@@ -808,6 +843,72 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUpload(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadE2E(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+    file_id: JString<'_>,
+    plaintext_size: jlong,
+    fd: jint,
+    identity_handle: jlong,
+    peer: JByteArray<'_>,
+    from: JString<'_>,
+    to: JString<'_>,
+    observer: JObject<'_>,
+) -> jboolean {
+    let result = (|| -> Result<(), String> {
+        if plaintext_size < 0 || fd < 0 {
+            return Err("invalid E2E media source".to_string());
+        }
+        let peer: [u8; 32] = java_bytes(&mut env, peer)?
+            .try_into()
+            .map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        let (endpoint, public_key, ticket, file_id) =
+            transfer_strings(&mut env, endpoint, public_key, ticket, file_id)?;
+        let from = java_string(&mut env, from)?;
+        let to = java_string(&mut env, to)?;
+        let identity = identity(identity_handle)?;
+        let progress = JavaProgress::new(&mut env, observer, plaintext_size as u64)?;
+        let file = duplicate_file(fd)?;
+        let mut source = ProgressReader {
+            inner: tokio::fs::File::from_std(file),
+            progress: progress.clone(),
+            completed: 0,
+        };
+        if let Some(progress) = &progress {
+            progress.update(0).map_err(|error| error.to_string())?;
+        }
+        runtime()?
+            .block_on(async {
+                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
+                let result = client
+                    .upload_media_e2e(
+                        &file_id,
+                        plaintext_size as u64,
+                        &mut source,
+                        &identity,
+                        peer,
+                        &from,
+                        &to,
+                    )
+                    .await;
+                let _ = client.close().await;
+                result
+            })
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            throw_io(&mut env, error);
+            JNI_FALSE
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadBatch(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
@@ -966,6 +1067,134 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownload(
         Err(error) => {
             throw_io(&mut env, error);
             -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2E(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+    file_id: JString<'_>,
+    expected_encrypted_size: jlong,
+    fd: jint,
+    identity_handle: jlong,
+    peer: JByteArray<'_>,
+    from: JString<'_>,
+    to: JString<'_>,
+    observer: JObject<'_>,
+) -> jlong {
+    let result = (|| -> Result<u64, String> {
+        if expected_encrypted_size < 0 || fd < 0 {
+            return Err("invalid E2E media target".to_string());
+        }
+        let peer: [u8; 32] = java_bytes(&mut env, peer)?
+            .try_into()
+            .map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        let (endpoint, public_key, ticket, file_id) =
+            transfer_strings(&mut env, endpoint, public_key, ticket, file_id)?;
+        let from = java_string(&mut env, from)?;
+        let to = java_string(&mut env, to)?;
+        let identity = identity(identity_handle)?;
+        let file = duplicate_file(fd)?;
+        let mut target = ProgressWriter {
+            inner: tokio::fs::File::from_std(file),
+            progress: JavaProgress::new(&mut env, observer, 0)?,
+            completed: 0,
+        };
+        runtime()?
+            .block_on(async {
+                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
+                let result = client
+                    .download_media_e2e(
+                        &file_id,
+                        expected_encrypted_size as u64,
+                        &mut target,
+                        &identity,
+                        peer,
+                        &from,
+                        &to,
+                    )
+                    .await;
+                let _ = client.close().await;
+                result
+            })
+            .map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => value as jlong,
+        Err(error) => {
+            throw_io(&mut env, error);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2EBytes(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+    file_id: JString<'_>,
+    expected_encrypted_size: jlong,
+    max_bytes: jint,
+    identity_handle: jlong,
+    peer: JByteArray<'_>,
+    from: JString<'_>,
+    to: JString<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        if expected_encrypted_size < 0 || max_bytes < 1 {
+            return Err("invalid E2E in-memory media size".to_string());
+        }
+        let peer: [u8; 32] = java_bytes(&mut env, peer)?
+            .try_into()
+            .map_err(|_| "E2E public key must be 32 bytes".to_string())?;
+        let (endpoint, public_key, ticket, file_id) =
+            transfer_strings(&mut env, endpoint, public_key, ticket, file_id)?;
+        let from = java_string(&mut env, from)?;
+        let to = java_string(&mut env, to)?;
+        let identity = identity(identity_handle)?;
+        let mut target = MemoryWriter {
+            bytes: Vec::with_capacity((max_bytes as usize).min(256 * 1024)),
+            limit: max_bytes as usize,
+        };
+        runtime()?
+            .block_on(async {
+                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
+                let result = client
+                    .download_media_e2e(
+                        &file_id,
+                        expected_encrypted_size as u64,
+                        &mut target,
+                        &identity,
+                        peer,
+                        &from,
+                        &to,
+                    )
+                    .await;
+                let _ = client.close().await;
+                result
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(target.bytes)
+    })();
+    match result {
+        Ok(bytes) => match env.byte_array_from_slice(&bytes) {
+            Ok(array) => array.into_raw(),
+            Err(error) => {
+                throw_io(&mut env, error);
+                std::ptr::null_mut()
+            }
+        },
+        Err(error) => {
+            throw_io(&mut env, error);
+            std::ptr::null_mut()
         }
     }
 }
@@ -1297,8 +1526,8 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EDecrypt(
         let from = java_string(&mut env, from)?;
         let to = java_string(&mut env, to)?;
         let encoded = java_bytes(&mut env, encoded)?;
-        if encoded.len() < 41 || encoded[0] != 3 {
-            return Err("invalid E2E v3 envelope".to_string());
+        if encoded.len() < 41 || !matches!(encoded[0], LEGACY_ENVELOPE_VERSION | ENVELOPE_VERSION) {
+            return Err("unsupported E2E envelope version; update the application".to_string());
         }
         let value = Envelope {
             version: encoded[0],
@@ -1319,6 +1548,44 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EDecrypt(
             std::ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EMediaSeal(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    peer: JByteArray<'_>,
+    from: JString<'_>,
+    to: JString<'_>,
+    file_id: JString<'_>,
+    plaintext: JByteArray<'_>,
+) -> jbyteArray {
+    let _ = (handle, peer, from, to, file_id, plaintext);
+    throw_io(
+        &mut env,
+        "E2E media V1 was removed; use descriptor streaming",
+    );
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EMediaDecrypt(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    peer: JByteArray<'_>,
+    from: JString<'_>,
+    to: JString<'_>,
+    file_id: JString<'_>,
+    encoded: JByteArray<'_>,
+) -> jbyteArray {
+    let _ = (handle, peer, from, to, file_id, encoded);
+    throw_io(
+        &mut env,
+        "E2E media V1 was removed; use descriptor streaming",
+    );
+    std::ptr::null_mut()
 }
 
 #[no_mangle]

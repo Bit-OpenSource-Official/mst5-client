@@ -1,5 +1,6 @@
+use bytes::Bytes;
 use chacha20poly1305::{
-    aead::{Aead, Payload},
+    aead::{Aead, AeadInPlace, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
 };
 use hkdf::Hkdf;
@@ -19,9 +20,9 @@ use zeroize::Zeroize;
 
 mod account;
 mod connection;
-mod m5oh;
 pub mod e2e;
 pub mod image;
+mod m5oh;
 pub mod messenger;
 pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
 use connection::Mst5Connection;
@@ -54,6 +55,8 @@ const HANDSHAKE_MESSAGE_LEN: usize = 48;
 const TAG_LEN: usize = 16;
 const MAX_TRANSPORT_PAYLOAD: usize = 20 * 1024 * 1024;
 const PADDING_BLOCK: usize = 256;
+const LARGE_PADDING_BLOCK: usize = 128;
+const LARGE_PADDING_THRESHOLD: usize = 1024;
 const MAX_RECORDS: u64 = 1 << 20;
 const MAX_PLAINTEXT_BYTES: u64 = 1 << 30;
 const REKEY_RECORDS: u64 = 1 << 18;
@@ -65,6 +68,7 @@ const MST5_HEADER_LEN: usize = 40;
 const MST5_MAX_WIRE_PAYLOAD: usize = 4 * 1024 * 1024;
 const MST5_MAX_PLAIN_PAYLOAD: usize = 4 * 1024 * 1024;
 const MST5_FLAG_DEFLATE: u8 = 1;
+const MST5_FLAG_ZSTD: u8 = 1 << 1;
 const MST5_MAX_COMPRESSION_RATIO: usize = 64;
 const TRANSPORT_MAJOR: u64 = 5;
 const RPC_MAJOR: u64 = 1;
@@ -77,6 +81,7 @@ const FEATURE_DEADLINE: u64 = 1 << 4;
 const FEATURE_CANCEL: u64 = 1 << 5;
 pub const FEATURE_MEDIA_STREAMS: u64 = 1 << 6;
 pub const FEATURE_VOICE_STREAMS: u64 = 1 << 7;
+pub const FEATURE_ZSTD: u64 = 1 << 8;
 const CLIENT_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_STRUCTURED_ERRORS
     | FEATURE_CBOR_QUERY
@@ -84,7 +89,8 @@ const CLIENT_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_DEADLINE
     | FEATURE_CANCEL
     | FEATURE_MEDIA_STREAMS
-    | FEATURE_VOICE_STREAMS;
+    | FEATURE_VOICE_STREAMS
+    | FEATURE_ZSTD;
 const REQUIRED_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_STRUCTURED_ERRORS
     | FEATURE_CBOR_QUERY
@@ -101,6 +107,8 @@ pub mod feature {
     pub const CANCEL: u64 = 1 << 5;
     pub const MEDIA_STREAMS: u64 = 1 << 6;
     pub const VOICE_STREAMS: u64 = 1 << 7;
+    /// zstd-compressed `RESULT` and `EVENT_BATCH` frame payloads.
+    pub const ZSTD: u64 = 1 << 8;
 }
 
 pub mod kind {
@@ -216,6 +224,8 @@ pub mod op {
     pub const STICKER_PURCHASE: u16 = 83;
     pub const STICKER_SEND: u16 = 84;
     pub const STICKER_PRICE: u16 = 85;
+    pub const AVATAR_PREPARE: u16 = 86;
+    pub const AVATAR_COMMIT: u16 = 87;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -425,7 +435,7 @@ impl Response {
             id: frame.id,
             request_nonce: frame.request_nonce,
             deadline_ms: frame.deadline_ms,
-            payload: frame.payload,
+            payload: frame.payload.to_vec(),
         }
     }
 
@@ -738,7 +748,7 @@ impl VoiceStream {
         let frame = self.stream.recv(self.read_timeout).await?;
         match frame.kind {
             kind::STREAM_DATA if frame.id == self.stream.id() && !frame.payload.is_empty() => {
-                Ok(frame.payload)
+                Ok(frame.payload.to_vec())
             }
             kind::STREAM_END | kind::STREAM_ABORT => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -841,8 +851,18 @@ impl Client {
         // exactly the same order and pin validation.
         if endpoint.contains('|') {
             let mut last_error = None;
-            for candidate in endpoint.split('|').map(str::trim).filter(|value| !value.is_empty()) {
-                match Self::connect_one_with_key_and_options(candidate, pinned_public_key, options.clone()).await {
+            for candidate in endpoint
+                .split('|')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                match Self::connect_one_with_key_and_options(
+                    candidate,
+                    pinned_public_key,
+                    options.clone(),
+                )
+                .await
+                {
                     Ok(client) => return Ok(client),
                     Err(error) => last_error = Some(error),
                 }
@@ -859,13 +879,17 @@ impl Client {
     ) -> io::Result<Self> {
         let endpoint = parse_endpoint(endpoint)?;
         let mut stream = match endpoint.m5oh.as_ref() {
-            Some(endpoint) => m5oh::open_loopback_bridge(endpoint.clone(), options.connect_timeout).await?,
-            None => io_timeout(
-                options.connect_timeout,
-                "MST5 connect timed out",
-                TcpStream::connect(&endpoint.address),
-            )
-            .await?,
+            Some(endpoint) => {
+                m5oh::open_loopback_bridge(endpoint.clone(), options.connect_timeout).await?
+            }
+            None => {
+                io_timeout(
+                    options.connect_timeout,
+                    "MST5 connect timed out",
+                    TcpStream::connect(&endpoint.address),
+                )
+                .await?
+            }
         };
         stream.set_nodelay(options.nodelay)?;
         if let Some(route) = endpoint.route.as_deref() {
@@ -1011,7 +1035,8 @@ impl Client {
         token: &str,
         client_name: &str,
     ) -> io::Result<AuthInfo> {
-        self.authenticate_info_with_client_metadata(token, client_name, "").await
+        self.authenticate_info_with_client_metadata(token, client_name, "")
+            .await
     }
 
     /// Authenticates and records both the client label and physical device model
@@ -1231,13 +1256,13 @@ impl Client {
                 return Err(invalid_data("media source exceeds declared size"));
             }
             hasher.update(&buffer[..count]);
-            if let Err(error) = pending
-                .send(kind::STREAM_DATA, 0, buffer[..count].to_vec())
-                .await
-            {
+            buffer.truncate(count);
+            let payload = std::mem::take(&mut buffer);
+            if let Err(error) = pending.send(kind::STREAM_DATA, 0, payload).await {
                 pending.abort(500).await;
                 return Err(error);
             }
+            buffer = vec![0u8; MEDIA_CHUNK_SIZE];
         }
         if sent != size {
             pending.abort(400).await;
@@ -1245,6 +1270,106 @@ impl Client {
                 io::ErrorKind::UnexpectedEof,
                 "media source is shorter than declared size",
             ));
+        }
+        let end = Value::map([
+            ("size", Value::from(sent)),
+            ("sha256", Value::from(media_hex(&hasher.finalize()))),
+        ]);
+        pending
+            .send(kind::STREAM_END, 200, end.encode_cbor())
+            .await?;
+        let response = Response::from_frame(pending.recv(self.read_timeout).await?);
+        if response.kind != kind::RESULT || response.status != 200 {
+            return response.into_result().map(|_| ());
+        }
+        Ok(())
+    }
+
+    /// Encrypts `source` directly into the media upload stream. Neither the
+    /// managed caller nor the filesystem ever holds a complete ciphertext.
+    pub async fn upload_media_e2e<R: AsyncRead + Unpin>(
+        &self,
+        file_id: &str,
+        plaintext_size: u64,
+        source: &mut R,
+        identity: &e2e::Identity,
+        peer_public: [u8; 32],
+        from_id: &str,
+        to_id: &str,
+    ) -> io::Result<()> {
+        let encrypted_size = e2e::encrypted_media_size(plaintext_size)?;
+        if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "media client is not authenticated",
+            ));
+        }
+        let deadline_ms = unix_now_ms().saturating_add(duration_ms(self.read_timeout));
+        let open = Value::map([
+            ("file_id", Value::from(file_id)),
+            ("size", Value::from(encrypted_size)),
+        ]);
+        let mut pending = self
+            .connection
+            .begin(
+                kind::STREAM_OPEN,
+                media_op::UPLOAD,
+                [0; 16],
+                deadline_ms,
+                open.encode_cbor(),
+            )
+            .await?;
+        let accepted = pending.recv(self.read_timeout).await?;
+        if accepted.id != pending.id() || accepted.kind != kind::ACK || accepted.code != 100 {
+            pending.remove().await;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "media upload rejected",
+            ));
+        }
+        let mut encryptor =
+            identity.media_encryptor(peer_public, from_id, to_id, file_id, plaintext_size)?;
+        let header = encryptor.header();
+        let mut hasher = Sha256::new();
+        let mut sent = 0u64;
+        let mut buffer = vec![0u8; e2e::MEDIA_CHUNK_SIZE];
+        let header = header.to_vec();
+        hasher.update(&header);
+        sent = sent
+            .checked_add(header.len() as u64)
+            .ok_or_else(|| invalid_data("E2E media upload size overflow"))?;
+        if let Err(error) = pending.send(kind::STREAM_DATA, 0, header).await {
+            pending.abort(500).await;
+            return Err(error);
+        }
+        loop {
+            let count = match source.read(&mut buffer).await {
+                Ok(value) => value,
+                Err(error) => {
+                    pending.abort(500).await;
+                    return Err(error);
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            let encrypted = encryptor.seal_chunk(&buffer[..count])?;
+            hasher.update(&encrypted);
+            sent = sent
+                .checked_add(encrypted.len() as u64)
+                .ok_or_else(|| invalid_data("E2E media upload size overflow"))?;
+            if let Err(error) = pending.send(kind::STREAM_DATA, 0, encrypted).await {
+                pending.abort(500).await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = encryptor.finish() {
+            pending.abort(400).await;
+            return Err(error);
+        }
+        if sent != encrypted_size {
+            pending.abort(500).await;
+            return Err(invalid_data("E2E media ciphertext size mismatch"));
         }
         let end = Value::map([
             ("size", Value::from(sent)),
@@ -1337,6 +1462,105 @@ impl Client {
                         return Err(error);
                     }
                     return Ok(received);
+                }
+                kind::ERROR => {
+                    return Err(api_response_error(
+                        frame.code,
+                        &Value::decode_cbor(&frame.payload)?,
+                    ))
+                }
+                _ => return Err(invalid_data("unexpected media download frame")),
+            }
+        }
+    }
+
+    /// Downloads and authenticates V2 E2E media while writing recovered bytes
+    /// incrementally to `target`.
+    pub async fn download_media_e2e<W: AsyncWrite + Unpin>(
+        &self,
+        file_id: &str,
+        expected_encrypted_size: u64,
+        target: &mut W,
+        identity: &e2e::Identity,
+        peer_public: [u8; 32],
+        from_id: &str,
+        to_id: &str,
+    ) -> io::Result<u64> {
+        if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "media client is not authenticated",
+            ));
+        }
+        let deadline_ms = unix_now_ms().saturating_add(duration_ms(self.read_timeout));
+        let mut pending = self
+            .connection
+            .begin(
+                kind::STREAM_OPEN,
+                media_op::DOWNLOAD,
+                [0; 16],
+                deadline_ms,
+                Value::map([("file_id", Value::from(file_id))]).encode_cbor(),
+            )
+            .await?;
+        let accepted = pending.recv(self.read_timeout).await?;
+        if accepted.id != pending.id() || accepted.kind != kind::ACK || accepted.code != 100 {
+            pending.remove().await;
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "media download rejected",
+            ));
+        }
+        let metadata = Value::decode_cbor(&accepted.payload)?;
+        let announced = metadata
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid_data("media node omitted size"))?;
+        if announced != expected_encrypted_size {
+            pending.abort(409).await;
+            return Err(invalid_data("media size changed"));
+        }
+        let mut decryptor = identity.media_decryptor(peer_public, from_id, to_id, file_id)?;
+        let mut hasher = Sha256::new();
+        let mut received = 0u64;
+        let mut plaintext = 0u64;
+        loop {
+            let frame = pending.recv(self.read_timeout).await?;
+            if frame.id != pending.id() {
+                return Err(invalid_data("media stream id mismatch"));
+            }
+            match frame.kind {
+                kind::STREAM_DATA => {
+                    if frame.payload.is_empty() || frame.payload.len() > MEDIA_CHUNK_SIZE {
+                        return Err(invalid_data("invalid media chunk"));
+                    }
+                    received = received
+                        .checked_add(frame.payload.len() as u64)
+                        .ok_or_else(|| invalid_data("media size overflow"))?;
+                    if received > announced {
+                        return Err(invalid_data("media exceeds announced size"));
+                    }
+                    hasher.update(&frame.payload);
+                    for chunk in decryptor.push(&frame.payload)? {
+                        target.write_all(&chunk).await?;
+                        plaintext += chunk.len() as u64;
+                    }
+                }
+                kind::STREAM_END => {
+                    let end = Value::decode_cbor(&frame.payload)?;
+                    if received != announced
+                        || end.get("size").and_then(Value::as_u64) != Some(received)
+                        || end.get("sha256").and_then(Value::as_str)
+                            != Some(media_hex(&hasher.finalize()).as_str())
+                    {
+                        return Err(invalid_data("media download checksum mismatch"));
+                    }
+                    let final_size = decryptor.finish()?;
+                    if final_size != plaintext {
+                        return Err(invalid_data("E2E media plaintext size mismatch"));
+                    }
+                    target.flush().await?;
+                    return Ok(plaintext);
                 }
                 kind::ERROR => {
                     return Err(api_response_error(
@@ -1990,7 +2214,10 @@ impl Client {
     pub async fn set_sticker_pack_price(&self, id: &str, price_dsr: i64) -> io::Result<Value> {
         self.command_result(
             op::STICKER_PRICE,
-            Value::map([("id", Value::from(id)), ("price_dsr", Value::from(price_dsr))]),
+            Value::map([
+                ("id", Value::from(id)),
+                ("price_dsr", Value::from(price_dsr)),
+            ]),
         )
         .await
     }
@@ -2466,11 +2693,12 @@ struct Frame {
     id: u64,
     request_nonce: [u8; 16],
     deadline_ms: u64,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 impl Frame {
-    fn new(kind: u8, code: u16, id: u64, payload: Vec<u8>) -> io::Result<Self> {
+    fn new(kind: u8, code: u16, id: u64, payload: impl Into<Bytes>) -> io::Result<Self> {
+        let payload = payload.into();
         if !valid_kind(kind) {
             return Err(invalid_input("invalid MST5 frame kind"));
         }
@@ -2494,7 +2722,7 @@ impl Frame {
         id: u64,
         request_nonce: [u8; 16],
         deadline_ms: u64,
-        payload: Vec<u8>,
+        payload: impl Into<Bytes>,
     ) -> io::Result<Self> {
         let mut frame = Self::new(kind, code, id, payload)?;
         frame.request_nonce = request_nonce;
@@ -2503,13 +2731,20 @@ impl Frame {
     }
 
     fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(MST5_HEADER_LEN + self.payload.len());
+        self.encode_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) -> io::Result<()> {
         if self.flags != 0 {
             return Err(invalid_input("client MST5 frames must not use compression"));
         }
         if self.payload.len() > MST5_MAX_WIRE_PAYLOAD {
             return Err(invalid_input("MST5 wire payload is too large"));
         }
-        let mut out = Vec::with_capacity(MST5_HEADER_LEN + self.payload.len());
+        out.clear();
+        out.reserve(MST5_HEADER_LEN + self.payload.len());
         out.push(self.kind);
         out.push(self.flags);
         out.extend_from_slice(&self.code.to_be_bytes());
@@ -2518,10 +2753,16 @@ impl Frame {
         out.extend_from_slice(&self.deadline_ms.to_be_bytes());
         out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.payload);
-        Ok(out)
+        Ok(())
     }
 
     fn decode(input: &[u8]) -> io::Result<Self> {
+        let mut zstd = zstd::bulk::Decompressor::new()
+            .map_err(|_| invalid_data("cannot initialize MST5 zstd decompressor"))?;
+        Self::decode_with_zstd(input, &mut zstd)
+    }
+
+    fn decode_with_zstd(input: &[u8], zstd: &mut zstd::bulk::Decompressor<'_>) -> io::Result<Self> {
         if input.len() < MST5_HEADER_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -2530,10 +2771,15 @@ impl Frame {
         }
         let kind = input[0];
         let flags = input[1];
-        if !valid_kind(kind) || flags & !MST5_FLAG_DEFLATE != 0 {
+        if !valid_kind(kind)
+            || flags & !(MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD) != 0
+            || flags & (MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD) == (MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD)
+        {
             return Err(invalid_data("invalid MST5 frame header"));
         }
-        if flags & MST5_FLAG_DEFLATE != 0 && !matches!(kind, kind::RESULT | kind::EVENT_BATCH) {
+        if flags & (MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD) != 0
+            && !matches!(kind, kind::RESULT | kind::EVENT_BATCH)
+        {
             return Err(invalid_data("compressed MST5 control frame"));
         }
         let code = u16::from_be_bytes([input[2], input[3]]);
@@ -2562,13 +2808,15 @@ impl Frame {
         let payload = if flags & MST5_FLAG_DEFLATE != 0 {
             decompress_to_vec_with_limit(wire_payload, MST5_MAX_PLAIN_PAYLOAD)
                 .map_err(|_| invalid_data("invalid or oversized MST5 deflate payload"))?
+        } else if flags & MST5_FLAG_ZSTD != 0 {
+            zstd_decompress_bounded(zstd, wire_payload, MST5_MAX_PLAIN_PAYLOAD)?
         } else {
             wire_payload.to_vec()
         };
         if payload.len() > MST5_MAX_PLAIN_PAYLOAD {
             return Err(invalid_data("inflated MST5 payload is too large"));
         }
-        if flags & MST5_FLAG_DEFLATE != 0
+        if flags & (MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD) != 0
             && !wire_payload.is_empty()
             && payload.len()
                 > wire_payload
@@ -2584,9 +2832,29 @@ impl Frame {
             id,
             request_nonce,
             deadline_ms,
-            payload,
+            payload: Bytes::from(payload),
         })
     }
+}
+
+fn zstd_decompress_bounded(
+    zstd: &mut zstd::bulk::Decompressor<'_>,
+    input: &[u8],
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    if input.is_empty() {
+        return Err(invalid_data("empty MST5 zstd payload"));
+    }
+    let output = zstd
+        .decompress(input, limit)
+        .map_err(|_| invalid_data("invalid or oversized MST5 zstd payload"))?;
+    if output.len() > limit {
+        return Err(invalid_data("inflated MST5 payload is too large"));
+    }
+    if output.len() > input.len().saturating_mul(MST5_MAX_COMPRESSION_RATIO) {
+        return Err(invalid_data("MST5 compression ratio exceeds limit"));
+    }
+    Ok(output)
 }
 
 fn valid_kind(value: u8) -> bool {
@@ -2951,6 +3219,16 @@ fn require_nonzero_shared(shared: &[u8; 32]) -> io::Result<()> {
 }
 
 fn transport_plaintext(content_type: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let mut plaintext = Vec::new();
+    transport_plaintext_into(&mut plaintext, content_type, payload)?;
+    Ok(plaintext)
+}
+
+fn transport_plaintext_into(
+    plaintext: &mut Vec<u8>,
+    content_type: u8,
+    payload: &[u8],
+) -> io::Result<()> {
     if content_type > 1 || (content_type == 1 && !payload.is_empty()) {
         return Err(invalid_input("invalid MST5 transport content type"));
     }
@@ -2960,19 +3238,26 @@ fn transport_plaintext(content_type: u8, payload: &[u8]) -> io::Result<Vec<u8>> 
     let base = 5usize
         .checked_add(payload.len())
         .ok_or_else(|| invalid_input("MST5 transport payload overflow"))?;
+    let block = if base <= LARGE_PADDING_THRESHOLD {
+        PADDING_BLOCK
+    } else {
+        LARGE_PADDING_BLOCK
+    };
     let padded = base
-        .checked_add(PADDING_BLOCK - 1)
-        .map(|value| value / PADDING_BLOCK * PADDING_BLOCK)
+        .checked_add(block - 1)
+        .map(|value| value / block * block)
         .ok_or_else(|| invalid_input("MST5 transport padding overflow"))?;
-    let mut plaintext = vec![0u8; padded];
+    plaintext.clear();
+    plaintext.resize(padded, 0);
     plaintext[0] = content_type;
     plaintext[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     plaintext[5..5 + payload.len()].copy_from_slice(payload);
-    Ok(plaintext)
+    Ok(())
 }
 
 fn parse_transport_plaintext(plaintext: &[u8]) -> io::Result<Record> {
-    if plaintext.len() < PADDING_BLOCK || !plaintext.len().is_multiple_of(PADDING_BLOCK) {
+    if plaintext.len() < LARGE_PADDING_BLOCK || !plaintext.len().is_multiple_of(LARGE_PADDING_BLOCK)
+    {
         return Err(invalid_data("invalid MST5 transport padding length"));
     }
     let content_type = plaintext[0];
@@ -2996,7 +3281,7 @@ fn parse_transport_plaintext(plaintext: &[u8]) -> io::Result<Record> {
 
 fn max_record_len() -> usize {
     let base = 5 + MAX_TRANSPORT_PAYLOAD;
-    let padded = base.div_ceil(PADDING_BLOCK) * PADDING_BLOCK;
+    let padded = base.div_ceil(LARGE_PADDING_BLOCK) * LARGE_PADDING_BLOCK;
     8 + padded + TAG_LEN
 }
 
@@ -3033,6 +3318,21 @@ fn aead_encrypt(key: &[u8; 32], nonce: u64, aad: &[u8], plaintext: &[u8]) -> io:
                 aad,
             },
         )
+        .map_err(|_| invalid_data("MST5 encryption failed"))
+}
+
+fn aead_encrypt_in_place(
+    key: &[u8; 32],
+    nonce: u64,
+    aad: &[u8],
+    plaintext: &mut Vec<u8>,
+) -> io::Result<[u8; TAG_LEN]> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| invalid_input("invalid ChaCha20-Poly1305 key"))?;
+    let nonce_bytes = aead_nonce(nonce);
+    cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), aad, plaintext)
+        .map(Into::into)
         .map_err(|_| invalid_data("MST5 encryption failed"))
 }
 
@@ -3372,11 +3672,19 @@ fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
     let value = endpoint.trim().trim_end_matches('/');
     if let Some(address) = value.strip_prefix("m5ohs://") {
         let (endpoint, route) = parse_m5oh_endpoint(address, 443, true)?;
-        return Ok(ParsedEndpoint { address: String::new(), route, m5oh: Some(endpoint) });
+        return Ok(ParsedEndpoint {
+            address: String::new(),
+            route,
+            m5oh: Some(endpoint),
+        });
     }
     if let Some(address) = value.strip_prefix("m5oh://") {
         let (endpoint, route) = parse_m5oh_endpoint(address, 80, false)?;
-        return Ok(ParsedEndpoint { address: String::new(), route, m5oh: Some(endpoint) });
+        return Ok(ParsedEndpoint {
+            address: String::new(),
+            route,
+            m5oh: Some(endpoint),
+        });
     }
     if value.starts_with("https://") || value.starts_with("tcps://") {
         return Err(invalid_input(
@@ -3408,7 +3716,11 @@ fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
     })
 }
 
-fn parse_m5oh_endpoint(value: &str, default_port: u16, tls: bool) -> io::Result<(m5oh::Endpoint, Option<String>)> {
+fn parse_m5oh_endpoint(
+    value: &str,
+    default_port: u16,
+    tls: bool,
+) -> io::Result<(m5oh::Endpoint, Option<String>)> {
     let (address, route) = match value.split_once('/') {
         Some((address, route)) => {
             validate_route_id(route)?;
@@ -3416,7 +3728,12 @@ fn parse_m5oh_endpoint(value: &str, default_port: u16, tls: bool) -> io::Result<
         }
         None => (value, None),
     };
-    if address.is_empty() || address.contains('/') || address.chars().any(|value| value.is_whitespace() || value.is_control()) {
+    if address.is_empty()
+        || address.contains('/')
+        || address
+            .chars()
+            .any(|value| value.is_whitespace() || value.is_control())
+    {
         return Err(invalid_input("invalid M5oH endpoint"));
     }
     let (host, port) = if let Some(inner) = address.strip_prefix('[') {
@@ -3424,7 +3741,9 @@ fn parse_m5oh_endpoint(value: &str, default_port: u16, tls: bool) -> io::Result<
             .split_once(']')
             .ok_or_else(|| invalid_input("invalid M5oH IPv6 endpoint"))?;
         let port = match port.strip_prefix(':') {
-            Some(port) if !port.is_empty() => port.parse::<u16>().map_err(|_| invalid_input("invalid M5oH endpoint port"))?,
+            Some(port) if !port.is_empty() => port
+                .parse::<u16>()
+                .map_err(|_| invalid_input("invalid M5oH endpoint port"))?,
             None => default_port,
             _ => return Err(invalid_input("invalid M5oH IPv6 endpoint")),
         };
@@ -3433,14 +3752,26 @@ fn parse_m5oh_endpoint(value: &str, default_port: u16, tls: bool) -> io::Result<
         if host.contains(':') {
             return Err(invalid_input("M5oH IPv6 endpoints must use brackets"));
         }
-        (host.to_string(), port.parse::<u16>().map_err(|_| invalid_input("invalid M5oH endpoint port"))?)
+        (
+            host.to_string(),
+            port.parse::<u16>()
+                .map_err(|_| invalid_input("invalid M5oH endpoint port"))?,
+        )
     } else {
         (address.to_string(), default_port)
     };
     if host.is_empty() || port == 0 {
         return Err(invalid_input("invalid M5oH endpoint"));
     }
-    Ok((m5oh::Endpoint { host, port, tls, route: route.clone() }, route))
+    Ok((
+        m5oh::Endpoint {
+            host,
+            port,
+            tls,
+            route: route.clone(),
+        },
+        route,
+    ))
 }
 
 fn endpoint_socket_address(value: &str, default_port: u16) -> io::Result<String> {
@@ -3679,7 +4010,32 @@ mod tests {
         assert_eq!(decoded.id, 42);
         assert_eq!(decoded.request_nonce, [0x5a; 16]);
         assert_eq!(decoded.deadline_ms, 1_780_000_000_000);
-        assert_eq!(decoded.payload, b"payload");
+        assert_eq!(&decoded.payload[..], b"payload");
+    }
+
+    #[test]
+    fn frame_decodes_bounded_zstd_and_rejects_combined_flags() {
+        let mut state = 0x6a09_e667_u32;
+        let block: Vec<u8> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let payload = block.repeat(16);
+        let compressed = zstd::bulk::compress(&payload, 3).unwrap();
+        let mut encoded = Vec::new();
+        encoded.push(kind::EVENT_BATCH);
+        encoded.push(MST5_FLAG_ZSTD);
+        encoded.extend_from_slice(&200_u16.to_be_bytes());
+        encoded.extend_from_slice(&7_u64.to_be_bytes());
+        encoded.extend_from_slice(&[0_u8; 16]);
+        encoded.extend_from_slice(&0_u64.to_be_bytes());
+        encoded.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&compressed);
+        assert_eq!(Frame::decode(&encoded).unwrap().payload, payload);
+        encoded[1] = MST5_FLAG_DEFLATE | MST5_FLAG_ZSTD;
+        assert!(Frame::decode(&encoded).is_err());
     }
 
     #[test]
@@ -3746,7 +4102,12 @@ mod tests {
             ParsedEndpoint {
                 address: String::new(),
                 route: None,
-                m5oh: Some(m5oh::Endpoint { host: "m5oh.ms.ove.rs".to_string(), port: 443, tls: true, route: None }),
+                m5oh: Some(m5oh::Endpoint {
+                    host: "m5oh.ms.ove.rs".to_string(),
+                    port: 443,
+                    tls: true,
+                    route: None
+                }),
             }
         );
         assert_eq!(

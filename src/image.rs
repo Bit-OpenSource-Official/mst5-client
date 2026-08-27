@@ -14,6 +14,49 @@ pub struct DecodedImage {
     pub argb: Vec<u32>,
 }
 
+/// Image prepared by the native MST5 client for a message photo or avatar.
+/// The byte stream is always WebP; no Java image encoder is involved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedWebp {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Converts a user-selected photo to WebP. `square` makes a centred crop and
+/// resizes it exactly to `max_side` (used for 256×256 avatars); ordinary
+/// photos keep their aspect ratio and are only scaled down.
+pub fn prepare_webp(bytes: &[u8], max_side: u32, square: bool) -> io::Result<PreparedWebp> {
+    let image = load_supported_image(bytes)?;
+    let max_side = max_side.clamp(1, 4096);
+    let image = if square {
+        let (width, height) = image.dimensions();
+        let side = width.min(height);
+        image
+            .crop_imm((width - side) / 2, (height - side) / 2, side, side)
+            .resize_exact(max_side, max_side, FilterType::Triangle)
+    } else {
+        let (width, height) = image.dimensions();
+        if width.max(height) > max_side {
+            image.resize(max_side, max_side, FilterType::Triangle)
+        } else {
+            image
+        }
+    };
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    // libwebp's lossy VP8 encoder gives photographs a materially smaller
+    // payload than JPEG/PNG while retaining alpha support in the input path.
+    let output = webp::Encoder::from_rgba(rgba.as_raw(), width, height)
+        .encode(82.0)
+        .to_vec();
+    Ok(PreparedWebp {
+        width,
+        height,
+        bytes: output,
+    })
+}
+
 pub fn decode_image<R: Read>(
     mut reader: R,
     max_side: u32,
@@ -38,21 +81,7 @@ pub fn decode_image_bytes(
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_INPUT_BYTES {
         return Err(invalid_input("image input must contain 1..12582912 bytes"));
     }
-    let format = image::guess_format(bytes).map_err(image_error)?;
-    if !matches!(
-        format,
-        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP
-    ) {
-        return Err(invalid_input(
-            "only JPEG, PNG and WebP images are supported",
-        ));
-    }
-    let image = image::load_from_memory_with_format(bytes, format).map_err(image_error)?;
-    let image = if format == ImageFormat::Jpeg {
-        apply_exif_orientation(image, jpeg_orientation(bytes))
-    } else {
-        image
-    };
+    let image = load_supported_image(bytes)?;
     let (width, height) = image.dimensions();
     let source_pixels = u64::from(width).saturating_mul(u64::from(height));
     if width == 0 || height == 0 || source_pixels > MAX_IMAGE_SOURCE_PIXELS {
@@ -89,6 +118,35 @@ pub fn decode_image_bytes(
         height: target_height,
         argb,
     })
+}
+
+fn load_supported_image(bytes: &[u8]) -> io::Result<DynamicImage> {
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_INPUT_BYTES {
+        return Err(invalid_input("image input must contain 1..12582912 bytes"));
+    }
+    let format = image::guess_format(bytes).map_err(image_error)?;
+    if !matches!(
+        format,
+        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP
+    ) {
+        return Err(invalid_input(
+            "only JPEG, PNG and WebP images are supported",
+        ));
+    }
+    let image = image::load_from_memory_with_format(bytes, format).map_err(image_error)?;
+    let image = if format == ImageFormat::Jpeg {
+        apply_exif_orientation(image, jpeg_orientation(bytes))
+    } else {
+        image
+    };
+    let (width, height) = image.dimensions();
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > MAX_IMAGE_SOURCE_PIXELS {
+        return Err(invalid_input(
+            "image dimensions exceed the 64 MP decode limit",
+        ));
+    }
+    Ok(image)
 }
 
 fn jpeg_orientation(bytes: &[u8]) -> u32 {
@@ -143,5 +201,20 @@ mod tests {
     #[test]
     fn rejects_unsupported_input() {
         assert!(decode_image_bytes(b"not an image", 128, 1024).is_err());
+    }
+
+    #[test]
+    fn prepares_a_centred_256px_webp_avatar() {
+        let image = ImageBuffer::from_pixel(320, 160, Rgba([0x12, 0x34, 0x56, 0xff]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let prepared = prepare_webp(encoded.get_ref(), 256, true).unwrap();
+        assert_eq!((prepared.width, prepared.height), (256, 256));
+        assert_eq!(
+            image::guess_format(&prepared.bytes).unwrap(),
+            ImageFormat::WebP
+        );
     }
 }

@@ -6,9 +6,9 @@
 //! client keep the same audited Noise and frame implementation as raw MST5.
 
 #[cfg(feature = "m5oh-tls")]
-use rustls::{ClientConfig, RootCertStore};
-#[cfg(feature = "m5oh-tls")]
 use rustls::pki_types::{CertificateDer, ServerName};
+#[cfg(feature = "m5oh-tls")]
+use rustls::{ClientConfig, RootCertStore};
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
@@ -16,8 +16,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
-use tokio::net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
+};
 use tokio::time::timeout;
 #[cfg(feature = "m5oh-tls")]
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -28,6 +33,7 @@ const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
 // Reserve 13 bytes for `/?m5=file-main&r=` (the longest current route), so
 // URL-safe Base64 never exceeds that limit.
 const UPLOAD_CHUNK: usize = 23 * 1024 - 10;
+const UPLOAD_COALESCE: Duration = Duration::from_millis(2);
 // The production edge currently uses the project CA below rather than a
 // browser CA. Keep public WebPKI roots as well so independently hosted M5oH
 // domains can use ordinary public certificates.
@@ -60,7 +66,11 @@ enum HttpStream {
 }
 
 impl AsyncRead for HttpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "m5oh-tls")]
@@ -70,7 +80,11 @@ impl AsyncRead for HttpStream {
 }
 
 impl AsyncWrite for HttpStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match &mut *self {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "m5oh-tls")]
@@ -102,11 +116,16 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-pub(crate) async fn open_loopback_bridge(endpoint: Endpoint, connect_timeout: Duration) -> io::Result<TcpStream> {
+pub(crate) async fn open_loopback_bridge(
+    endpoint: Endpoint,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else { return };
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
         let _ = bridge(stream, endpoint, connect_timeout).await;
     });
     timeout(connect_timeout, TcpStream::connect(address))
@@ -114,14 +133,23 @@ pub(crate) async fn open_loopback_bridge(endpoint: Endpoint, connect_timeout: Du
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH local bridge timed out"))?
 }
 
-async fn bridge(stream: TcpStream, endpoint: Endpoint, connect_timeout: Duration) -> io::Result<()> {
+async fn bridge(
+    stream: TcpStream,
+    endpoint: Endpoint,
+    connect_timeout: Duration,
+) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let session_id = random_session_id()?;
     // seq=0 creates the remote TCP connection before the local client writes
     // the Noise prologue. This avoids a race with its initial read.
     request(&endpoint, connect_timeout, &session_id, "up", 0, &[], false).await?;
     let (reader, writer) = stream.into_split();
-    let mut upload = tokio::spawn(upload_loop(reader, endpoint.clone(), connect_timeout, session_id.clone()));
+    let mut upload = tokio::spawn(upload_loop(
+        reader,
+        endpoint.clone(),
+        connect_timeout,
+        session_id.clone(),
+    ));
     let mut download = tokio::spawn(download_loop(writer, endpoint, connect_timeout, session_id));
     tokio::select! {
         result = &mut upload => {
@@ -149,12 +177,62 @@ async fn upload_loop(
 ) -> io::Result<()> {
     let mut sequence = 1u64;
     let mut buffer = vec![0u8; UPLOAD_CHUNK];
+    let mut http = connect(&endpoint, connect_timeout).await?;
     loop {
-        let count = reader.read(&mut buffer).await?;
-        let eof = count == 0;
-        request(&endpoint, connect_timeout, &session_id, "up", sequence, &buffer[..count], eof).await?;
-        sequence = sequence.checked_add(1).ok_or_else(|| io::Error::other("M5oH upload sequence exhausted"))?;
-        if eof { return Ok(()); }
+        let mut count = reader.read(&mut buffer).await?;
+        let mut eof = count == 0;
+        // Coalesce immediately available MST5 records, but cap the added
+        // interactive latency at two milliseconds and never exceed CDN GET.
+        while !eof && count < buffer.len() {
+            match timeout(UPLOAD_COALESCE, reader.read(&mut buffer[count..])).await {
+                Ok(Ok(0)) => {
+                    eof = true;
+                    break;
+                }
+                Ok(Ok(read)) => count += read,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break,
+            }
+        }
+        let response = match request_on(
+            &mut http,
+            &endpoint,
+            &session_id,
+            "up",
+            sequence,
+            &buffer[..count],
+            eof,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                http = connect(&endpoint, connect_timeout).await?;
+                request_on(
+                    &mut http,
+                    &endpoint,
+                    &session_id,
+                    "up",
+                    sequence,
+                    &buffer[..count],
+                    eof,
+                )
+                .await?
+            }
+        };
+        if response
+            .headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+        {
+            http = connect(&endpoint, connect_timeout).await?;
+        }
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("M5oH upload sequence exhausted"))?;
+        if eof {
+            return Ok(());
+        }
     }
 }
 
@@ -165,15 +243,54 @@ async fn download_loop(
     session_id: String,
 ) -> io::Result<()> {
     let mut sequence = 0u64;
+    let mut http = connect(&endpoint, connect_timeout).await?;
     loop {
-        let response = request(&endpoint, connect_timeout, &session_id, "down", sequence, &[], false).await?;
+        let response = match request_on(
+            &mut http,
+            &endpoint,
+            &session_id,
+            "down",
+            sequence,
+            &[],
+            false,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                http = connect(&endpoint, connect_timeout).await?;
+                request_on(
+                    &mut http,
+                    &endpoint,
+                    &session_id,
+                    "down",
+                    sequence,
+                    &[],
+                    false,
+                )
+                .await?
+            }
+        };
         if !response.body.is_empty() {
             writer.write_all(&response.body).await?;
             writer.flush().await?;
         }
-        sequence = sequence.checked_add(1).ok_or_else(|| io::Error::other("M5oH download sequence exhausted"))?;
-        if response.headers.get("x-mst5-eof").is_some_and(|value| value == "1") {
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("M5oH download sequence exhausted"))?;
+        if response
+            .headers
+            .get("x-mst5-eof")
+            .is_some_and(|value| value == "1")
+        {
             return writer.shutdown().await;
+        }
+        if response
+            .headers
+            .get("connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+        {
+            http = connect(&endpoint, connect_timeout).await?;
         }
     }
 }
@@ -188,6 +305,27 @@ async fn request(
     eof: bool,
 ) -> io::Result<HttpResponse> {
     let mut stream = connect(endpoint, connect_timeout).await?;
+    request_on(
+        &mut stream,
+        endpoint,
+        session_id,
+        channel,
+        sequence,
+        payload,
+        eof,
+    )
+    .await
+}
+
+async fn request_on(
+    stream: &mut BufReader<HttpStream>,
+    endpoint: &Endpoint,
+    session_id: &str,
+    channel: &str,
+    sequence: u64,
+    payload: &[u8],
+    eof: bool,
+) -> io::Result<HttpResponse> {
     let is_down = channel == "down";
     let method = "GET";
     let user_agent = endpoint
@@ -197,7 +335,7 @@ async fn request(
         .unwrap_or_else(|| "OVE-MST5-M5oH/1".to_string());
     let target = get_target(endpoint.route.as_deref(), payload);
     let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {}\r\nX-MST5-Session: {session_id}\r\nX-MST5-Channel: {channel}\r\nX-MST5-Seq: {sequence}\r\nAccept: application/octet-stream\r\nUser-Agent: {user_agent}\r\nCache-Control: no-store\r\nConnection: close\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: {}\r\nX-MST5-Session: {session_id}\r\nX-MST5-Channel: {channel}\r\nX-MST5-Seq: {sequence}\r\nAccept: application/octet-stream\r\nUser-Agent: {user_agent}\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n",
         endpoint.host_header(),
     );
     if let Some(route) = &endpoint.route {
@@ -206,15 +344,21 @@ async fn request(
     if is_down {
         head.push_str("X-MST5-Max-Response: 8388608\r\n");
     }
-    if eof { head.push_str("X-MST5-EOF: 1\r\n"); }
+    if eof {
+        head.push_str("X-MST5-EOF: 1\r\n");
+    }
     head.push_str("\r\n");
     stream.get_mut().write_all(head.as_bytes()).await?;
     stream.get_mut().flush().await?;
-    let response = read_response(&mut stream).await?;
+    let response = read_response(&mut *stream).await?;
     if response.status != 200 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            format!("M5oH server returned HTTP {}: {}", response.status, String::from_utf8_lossy(&response.body)),
+            format!(
+                "M5oH server returned HTTP {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ),
         ));
     }
     Ok(response)
@@ -258,7 +402,10 @@ mod tests {
     #[test]
     fn uses_bit_proxy_get_framing_with_a_route_selector() {
         assert_eq!(get_target(Some("main"), &[]), "/?m5=main");
-        assert_eq!(get_target(Some("file-main"), &[0, 1, 2]), "/?m5=file-main&r=AAEC");
+        assert_eq!(
+            get_target(Some("file-main"), &[0, 1, 2]),
+            "/?m5=file-main&r=AAEC"
+        );
         assert_eq!(get_target(None, &[0, 1]), "/?r=AAE");
     }
 
@@ -269,29 +416,46 @@ mod tests {
     }
 }
 
-async fn connect(endpoint: &Endpoint, connect_timeout: Duration) -> io::Result<BufReader<HttpStream>> {
-    let address = if endpoint.host.contains(':') { format!("[{}]:{}", endpoint.host, endpoint.port) } else { format!("{}:{}", endpoint.host, endpoint.port) };
+async fn connect(
+    endpoint: &Endpoint,
+    connect_timeout: Duration,
+) -> io::Result<BufReader<HttpStream>> {
+    let address = if endpoint.host.contains(':') {
+        format!("[{}]:{}", endpoint.host, endpoint.port)
+    } else {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    };
     let stream = timeout(connect_timeout, TcpStream::connect(address))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH HTTP connect timed out"))??;
     stream.set_nodelay(true)?;
-    if !endpoint.tls { return Ok(BufReader::new(HttpStream::Plain(stream))); }
+    if !endpoint.tls {
+        return Ok(BufReader::new(HttpStream::Plain(stream)));
+    }
     #[cfg(feature = "m5oh-tls")]
     {
         let roots = m5oh_roots()?;
-        let config = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-        let name = ServerName::try_from(endpoint.host.clone())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid M5oH TLS hostname"))?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(endpoint.host.clone()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid M5oH TLS hostname")
+        })?;
         let connector = TlsConnector::from(Arc::new(config));
         let stream = timeout(connect_timeout, connector.connect(name, stream))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH TLS handshake timed out"))??;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "M5oH TLS handshake timed out")
+            })??;
         return Ok(BufReader::new(HttpStream::Tls(stream)));
     }
     #[cfg(not(feature = "m5oh-tls"))]
     {
         let _ = stream;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "M5oH HTTPS is unavailable in this build"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "M5oH HTTPS is unavailable in this build",
+        ))
     }
 }
 
@@ -299,53 +463,112 @@ async fn connect(endpoint: &Endpoint, connect_timeout: Duration) -> io::Result<B
 fn m5oh_roots() -> io::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let production_ca = crate::decode_base64(OVE_PRODUCTION_CA_DER_B64)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid embedded OVE M5oH CA: {error}")))?;
-    roots.add(CertificateDer::from(production_ca))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid embedded OVE M5oH CA: {error}")))?;
+    let production_ca = crate::decode_base64(OVE_PRODUCTION_CA_DER_B64).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid embedded OVE M5oH CA: {error}"),
+        )
+    })?;
+    roots
+        .add(CertificateDer::from(production_ca))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid embedded OVE M5oH CA: {error}"),
+            )
+        })?;
     Ok(roots)
 }
 
 async fn read_response(reader: &mut BufReader<HttpStream>) -> io::Result<HttpResponse> {
-    let status_line = read_line(reader).await?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "M5oH HTTP peer closed"))?;
+    let status_line = read_line(reader)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "M5oH HTTP peer closed"))?;
     let mut parts = status_line.splitn(3, ' ');
     if parts.next() != Some("HTTP/1.1") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "M5oH requires HTTP/1.1"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "M5oH requires HTTP/1.1",
+        ));
     }
-    let status = parts.next().unwrap_or_default().parse::<u16>()
+    let status = parts
+        .next()
+        .unwrap_or_default()
+        .parse::<u16>()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH HTTP status"))?;
     let mut headers = HashMap::new();
     let mut total = 0usize;
     loop {
-        let line = read_line(reader).await?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "M5oH HTTP headers truncated"))?;
-        total = total.checked_add(line.len()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "M5oH HTTP headers overflow"))?;
-        if total > MAX_HTTP_HEAD { return Err(io::Error::new(io::ErrorKind::InvalidData, "M5oH HTTP headers too large")); }
-        if line.is_empty() { break; }
-        let (name, value) = line.split_once(':').ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH HTTP header"))?;
+        let line = read_line(reader).await?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "M5oH HTTP headers truncated")
+        })?;
+        total = total.checked_add(line.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "M5oH HTTP headers overflow")
+        })?;
+        if total > MAX_HTTP_HEAD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "M5oH HTTP headers too large",
+            ));
+        }
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH HTTP header")
+        })?;
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
-    if headers.contains_key("transfer-encoding") { return Err(io::Error::new(io::ErrorKind::InvalidData, "chunked M5oH responses are unsupported")); }
-    let length = headers.get("content-length").map(|value| value.parse::<usize>()).transpose()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH content length"))?.unwrap_or(0);
-    if length > MAX_HTTP_BODY { return Err(io::Error::new(io::ErrorKind::InvalidData, "M5oH response too large")); }
+    if headers.contains_key("transfer-encoding") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunked M5oH responses are unsupported",
+        ));
+    }
+    let length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH content length"))?
+        .unwrap_or(0);
+    if length > MAX_HTTP_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "M5oH response too large",
+        ));
+    }
     let mut body = vec![0u8; length];
-    if length != 0 { reader.read_exact(&mut body).await?; }
-    Ok(HttpResponse { status, headers, body })
+    if length != 0 {
+        reader.read_exact(&mut body).await?;
+    }
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 async fn read_line(reader: &mut BufReader<HttpStream>) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();
     let read = reader.read_until(b'\n', &mut bytes).await?;
-    if read == 0 { return Ok(None); }
+    if read == 0 {
+        return Ok(None);
+    }
     if bytes.len() > MAX_HTTP_HEAD || !bytes.ends_with(b"\r\n") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid M5oH HTTP line"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid M5oH HTTP line",
+        ));
     }
     bytes.truncate(bytes.len() - 2);
-    String::from_utf8(bytes).map(Some).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "M5oH HTTP header is not UTF-8"))
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "M5oH HTTP header is not UTF-8"))
 }
 
 fn random_session_id() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(format!("M5oH random session failed: {error}")))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::other(format!("M5oH random session failed: {error}")))?;
     Ok(bytes.iter().map(|value| format!("{value:02x}")).collect())
 }

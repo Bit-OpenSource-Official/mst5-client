@@ -114,7 +114,9 @@ impl AccountClient {
                 "client_name must contain at most 64 characters",
             ));
         }
-        if config.device_model.chars().count() > 128 || config.device_model.chars().any(char::is_control) {
+        if config.device_model.chars().count() > 128
+            || config.device_model.chars().any(char::is_control)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "device_model must contain at most 128 printable characters",
@@ -160,7 +162,11 @@ impl AccountClient {
                 .map_err(|_| io::Error::other("MST5 account credentials lock poisoned"))?;
             let changed = credentials.0 != token || credentials.1 != client_name.trim();
             if changed {
-                *credentials = (token.to_string(), client_name.trim().to_string(), credentials.2.clone());
+                *credentials = (
+                    token.to_string(),
+                    client_name.trim().to_string(),
+                    credentials.2.clone(),
+                );
             }
             changed
         };

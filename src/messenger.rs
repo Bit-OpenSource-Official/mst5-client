@@ -198,7 +198,11 @@ impl MessengerCore {
             .clamp(1, 120_000);
         let (path, query) = split_query(&raw_path);
         let opcode = operation(&method, path)?;
-        let frame_kind = if method == "GET" { kind::QUERY } else { kind::COMMAND };
+        let frame_kind = if method == "GET" {
+            kind::QUERY
+        } else {
+            kind::COMMAND
+        };
         let payload_json = if method == "GET" {
             match query {
                 Some(value) if !value.is_empty() => json!({ "query": value }),
@@ -228,7 +232,9 @@ impl MessengerCore {
             "code": response.status,
             "body": cbor_to_json(&body),
         }))
-        .map_err(|error| io::Error::other(format!("cannot encode messenger JSON response: {error}")))
+        .map_err(|error| {
+            io::Error::other(format!("cannot encode messenger JSON response: {error}"))
+        })
     }
 }
 
@@ -389,6 +395,8 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("POST", "/messages/prepare") => op::MESSAGE_PREPARE,
         ("POST", "/messages/commit") => op::MESSAGE_COMMIT,
         ("POST", "/messages/cancel") => op::MESSAGE_CANCEL,
+        ("POST", "/avatars/prepare") => op::AVATAR_PREPARE,
+        ("POST", "/avatars/commit") => op::AVATAR_COMMIT,
         ("POST", "/profiles/description") => op::SET_PROFILE_DESCRIPTION,
         _ => {
             return Err(invalid_input(format!(
@@ -490,8 +498,9 @@ impl SessionStorage {
             version: SESSION_VERSION,
             values: values.clone(),
         };
-        let encoded = serde_json::to_vec(&document)
-            .map_err(|error| io::Error::other(format!("cannot encode messenger session: {error}")))?;
+        let encoded = serde_json::to_vec(&document).map_err(|error| {
+            io::Error::other(format!("cannot encode messenger session: {error}"))
+        })?;
         if encoded.len() > MAX_SESSION_BYTES {
             return Err(invalid_input("messenger session exceeds size limit"));
         }
@@ -569,7 +578,10 @@ mod tests {
     fn persistent_session_is_atomic_and_round_trips() {
         let root = std::env::temp_dir().join(format!(
             "mst5-session-test-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let mut store = SessionStorage::open(&root).unwrap();
         assert!(store.snapshot_json().unwrap().contains("\"exists\":false"));

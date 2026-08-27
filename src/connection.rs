@@ -3,17 +3,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{broadcast, mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 
 const MAX_IN_FLIGHT: usize = 64;
 const RESPONSE_QUEUE: usize = 128;
 const EVENT_QUEUE: usize = 128;
+const WRITER_QUEUE: usize = 128;
+const CONTROL_WRITER_QUEUE: usize = 64;
+const WRITER_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+const WRITER_BUDGET_UNIT: usize = 16 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 type PendingSender = mpsc::Sender<Result<Frame, String>>;
 
 pub(super) struct Mst5Connection {
-    writer: Mutex<WriterState>,
+    control_writer: mpsc::Sender<WriterCommand>,
+    media_writer: mpsc::Sender<WriterCommand>,
+    request_order: Mutex<u64>,
+    writer_budget: Arc<Semaphore>,
     pending: Mutex<HashMap<u64, PendingSender>>,
     events: broadcast::Sender<Response>,
     closed: AtomicBool,
@@ -25,7 +32,20 @@ struct WriterState {
     stream: OwnedWriteHalf,
     cipher: CipherState,
     handshake_hash: [u8; 32],
-    next_id: u64,
+    encoded: Vec<u8>,
+    plaintext: Vec<u8>,
+    record: Vec<u8>,
+}
+
+enum WriterCommand {
+    Frame {
+        frame: Frame,
+        complete: oneshot::Sender<io::Result<()>>,
+        _budget: OwnedSemaphorePermit,
+    },
+    Close {
+        complete: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 pub(super) struct PendingRequest {
@@ -48,19 +68,35 @@ impl Mst5Connection {
     pub(super) fn start(stream: TcpStream, session: Session, write_timeout: Duration) -> Arc<Self> {
         let (reader, writer) = stream.into_split();
         let (events, _) = broadcast::channel(EVENT_QUEUE);
+        let (control_writer, control_receiver) = mpsc::channel(CONTROL_WRITER_QUEUE);
+        let (media_writer, media_receiver) = mpsc::channel(WRITER_QUEUE);
         let connection = Arc::new(Self {
-            writer: Mutex::new(WriterState {
-                stream: writer,
-                cipher: session.seal,
-                handshake_hash: session.handshake_hash,
-                next_id: 1,
-            }),
+            control_writer,
+            media_writer,
+            request_order: Mutex::new(1),
+            writer_budget: Arc::new(Semaphore::new(WRITER_BUDGET_BYTES / WRITER_BUDGET_UNIT)),
             pending: Mutex::new(HashMap::new()),
             events,
             closed: AtomicBool::new(false),
             inflight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             write_timeout,
         });
+        let writer_state = WriterState {
+            stream: writer,
+            cipher: session.seal,
+            handshake_hash: session.handshake_hash,
+            encoded: Vec::with_capacity(16 * 1024),
+            plaintext: Vec::with_capacity(16 * 1024),
+            record: Vec::with_capacity(16 * 1024),
+        };
+        let weak = Arc::downgrade(&connection);
+        tokio::spawn(writer_loop(
+            weak,
+            writer_state,
+            control_receiver,
+            media_receiver,
+            write_timeout,
+        ));
         let weak = Arc::downgrade(&connection);
         tokio::spawn(reader_loop(
             weak,
@@ -97,7 +133,7 @@ impl Mst5Connection {
 
         let (sender, receiver) = mpsc::channel(RESPONSE_QUEUE);
         let wait_timeout = self.stage_timeout(deadline_ms)?;
-        let mut writer = tokio::time::timeout(wait_timeout, self.writer.lock())
+        let mut next_id = tokio::time::timeout(wait_timeout, self.request_order.lock())
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -108,13 +144,13 @@ impl Mst5Connection {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_error());
         }
-        let id = writer.next_id;
+        let id = *next_id;
         if id == 0 || id == u64::MAX {
             return Err(invalid_data(
                 "MST5 request ID space exhausted; reconnect required",
             ));
         }
-        writer.next_id += 1;
+        *next_id += 1;
         let frame = Frame::request(kind, code, id, request_nonce, deadline_ms, payload)?;
         self.pending.lock().await.insert(id, sender);
         let mut pending = PendingRequest {
@@ -125,19 +161,12 @@ impl Mst5Connection {
             _permit: permit,
         };
         let wait_timeout = self.stage_timeout(deadline_ms)?;
-        if let Err(error) = io_timeout(
-            wait_timeout,
-            "MST5 request timed out while writing",
-            write_frame_locked(&mut writer, &frame, self.write_timeout),
-        )
-        .await
-        {
+        if let Err(error) = self.enqueue_frame(frame, wait_timeout).await {
             pending.remove().await;
-            drop(writer);
             self.fail(format!("MST5 write failed: {error}")).await;
             return Err(error);
         }
-        drop(writer);
+        drop(next_id);
         Ok(pending)
     }
 
@@ -187,7 +216,7 @@ impl Mst5Connection {
         }
         let (sender, receiver) = mpsc::channel(RESPONSE_QUEUE);
         let wait_timeout = self.stage_timeout(deadline_ms)?;
-        let mut writer = tokio::time::timeout(wait_timeout, self.writer.lock())
+        let mut next_id = tokio::time::timeout(wait_timeout, self.request_order.lock())
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -198,19 +227,20 @@ impl Mst5Connection {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_error());
         }
-        let id = writer.next_id;
+        let id = *next_id;
         if id == 0 || id == u64::MAX {
             return Err(invalid_data(
                 "MST5 request ID space exhausted; reconnect required",
             ));
         }
-        writer.next_id += 1;
+        *next_id += 1;
         self.pending.lock().await.insert(id, sender);
         let frame = Frame::request(kind::STREAM_OPEN, code, id, [0; 16], deadline_ms, payload)?;
-        if let Err(error) = write_frame_locked(&mut writer, &frame, self.write_timeout).await {
+        if let Err(error) = self.enqueue_frame(frame, wait_timeout).await {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
+        drop(next_id);
         Ok(StreamHandle {
             connection: self.clone(),
             id,
@@ -238,10 +268,7 @@ impl Mst5Connection {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let result = {
-            let mut writer = self.writer.lock().await;
-            write_close_locked(&mut writer, self.write_timeout).await
-        };
+        let result = self.enqueue_close().await;
         self.fail_pending("MST5 client closed the connection").await;
         result
     }
@@ -250,8 +277,51 @@ impl Mst5Connection {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_error());
         }
-        let mut writer = self.writer.lock().await;
-        write_frame_locked(&mut writer, frame, self.write_timeout).await
+        self.enqueue_frame(frame.clone(), self.write_timeout).await
+    }
+
+    async fn enqueue_frame(&self, frame: Frame, duration: Duration) -> io::Result<()> {
+        let bytes = frame.payload.len().saturating_add(40);
+        let units = bytes.div_ceil(WRITER_BUDGET_UNIT).max(1) as u32;
+        let budget = tokio::time::timeout(
+            duration,
+            self.writer_budget.clone().acquire_many_owned(units),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MST5 writer queue is full"))?
+        .map_err(|_| closed_error())?;
+        let (complete_tx, complete_rx) = oneshot::channel();
+        let writer = if frame.kind == kind::STREAM_DATA {
+            &self.media_writer
+        } else {
+            &self.control_writer
+        };
+        tokio::time::timeout(
+            duration,
+            writer.send(WriterCommand::Frame {
+                frame,
+                complete: complete_tx,
+                _budget: budget,
+            }),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MST5 writer queue is full"))?
+        .map_err(|_| closed_error())?;
+        tokio::time::timeout(duration, complete_rx)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "MST5 write timed out"))?
+            .map_err(|_| closed_error())?
+    }
+
+    async fn enqueue_close(&self) -> io::Result<()> {
+        let (complete_tx, complete_rx) = oneshot::channel();
+        self.control_writer
+            .send(WriterCommand::Close {
+                complete: complete_tx,
+            })
+            .await
+            .map_err(|_| closed_error())?;
+        complete_rx.await.map_err(|_| closed_error())?
     }
 
     async fn remove_pending(&self, id: u64) {
@@ -479,14 +549,69 @@ fn is_terminal_response(kind: u8) -> bool {
     )
 }
 
+async fn writer_loop(
+    connection: Weak<Mst5Connection>,
+    mut writer: WriterState,
+    mut control: mpsc::Receiver<WriterCommand>,
+    mut media: mpsc::Receiver<WriterCommand>,
+    write_timeout: Duration,
+) {
+    loop {
+        let command = tokio::select! {
+            biased;
+            command = control.recv() => command,
+            command = media.recv() => command,
+        };
+        let Some(command) = command else { return };
+        let result = match &command {
+            WriterCommand::Frame { frame, .. } => {
+                write_frame_locked(&mut writer, frame, write_timeout).await
+            }
+            WriterCommand::Close { .. } => write_close_locked(&mut writer, write_timeout).await,
+        };
+        match command {
+            WriterCommand::Frame { complete, .. } | WriterCommand::Close { complete } => {
+                let failed = result.as_ref().err().map(ToString::to_string);
+                let _ = complete.send(result);
+                if let Some(error) = failed {
+                    if let Some(connection) = connection.upgrade() {
+                        connection.fail(format!("MST5 write failed: {error}")).await;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn reader_loop(
     connection: Weak<Mst5Connection>,
     mut reader: OwnedReadHalf,
     mut cipher: CipherState,
     handshake_hash: [u8; 32],
 ) {
+    let mut zstd = match zstd::bulk::Decompressor::new() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(connection) = connection.upgrade() {
+                connection
+                    .fail(format!("MST5 zstd initialization failed: {error}"))
+                    .await;
+            }
+            return;
+        }
+    };
+    let mut record_buffer = Vec::with_capacity(16 * 1024);
     loop {
-        let frame = match read_frame(&mut reader, &mut cipher, &handshake_hash).await {
+        let frame = match read_frame(
+            &mut reader,
+            &mut cipher,
+            &handshake_hash,
+            &mut zstd,
+            &mut record_buffer,
+        )
+        .await
+        {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 if let Some(connection) = connection.upgrade() {
@@ -542,40 +667,54 @@ async fn write_frame_locked(
     frame: &Frame,
     write_timeout: Duration,
 ) -> io::Result<()> {
-    let encoded = frame.encode()?;
-    let record = seal_record(&mut writer.cipher, &writer.handshake_hash, 0, &encoded)?;
+    frame.encode_into(&mut writer.encoded)?;
+    seal_record_into(
+        &mut writer.cipher,
+        &writer.handshake_hash,
+        0,
+        &writer.encoded,
+        &mut writer.plaintext,
+        &mut writer.record,
+    )?;
     io_timeout(
         write_timeout,
         "MST5 write timed out",
         writer
             .stream
-            .write_all(&(record.len() as u32).to_be_bytes()),
+            .write_all(&(writer.record.len() as u32).to_be_bytes()),
     )
     .await?;
     io_timeout(
         write_timeout,
         "MST5 write timed out",
-        writer.stream.write_all(&record),
+        writer.stream.write_all(&writer.record),
     )
     .await?;
     io_timeout(write_timeout, "MST5 flush timed out", writer.stream.flush()).await
 }
 
 async fn write_close_locked(writer: &mut WriterState, write_timeout: Duration) -> io::Result<()> {
-    let record = seal_record(&mut writer.cipher, &writer.handshake_hash, 1, &[])?;
+    seal_record_into(
+        &mut writer.cipher,
+        &writer.handshake_hash,
+        1,
+        &[],
+        &mut writer.plaintext,
+        &mut writer.record,
+    )?;
     let result = async {
         io_timeout(
             write_timeout,
             "MST5 close timed out",
             writer
                 .stream
-                .write_all(&(record.len() as u32).to_be_bytes()),
+                .write_all(&(writer.record.len() as u32).to_be_bytes()),
         )
         .await?;
         io_timeout(
             write_timeout,
             "MST5 close timed out",
-            writer.stream.write_all(&record),
+            writer.stream.write_all(&writer.record),
         )
         .await?;
         io_timeout(
@@ -590,13 +729,15 @@ async fn write_close_locked(writer: &mut WriterState, write_timeout: Duration) -
     result
 }
 
-fn seal_record(
+fn seal_record_into(
     cipher: &mut CipherState,
     handshake_hash: &[u8; 32],
     content_type: u8,
     payload: &[u8],
-) -> io::Result<Vec<u8>> {
-    let plaintext = transport_plaintext(content_type, payload)?;
+    plaintext: &mut Vec<u8>,
+    record: &mut Vec<u8>,
+) -> io::Result<()> {
+    transport_plaintext_into(plaintext, content_type, payload)?;
     cipher.check_limit(plaintext.len())?;
     let sequence = cipher.nonce;
     let frame_length = 8usize
@@ -604,18 +745,22 @@ fn seal_record(
         .and_then(|value| value.checked_add(TAG_LEN))
         .ok_or_else(|| invalid_data("MST5 record length overflow"))?;
     let aad = record_aad(handshake_hash, frame_length, sequence)?;
-    let ciphertext = aead_encrypt(&cipher.key, sequence, &aad, &plaintext)?;
-    let mut record = Vec::with_capacity(frame_length);
+    let tag = aead_encrypt_in_place(&cipher.key, sequence, &aad, plaintext)?;
+    record.clear();
+    record.reserve(frame_length);
     record.extend_from_slice(&sequence.to_be_bytes());
-    record.extend_from_slice(&ciphertext);
+    record.extend_from_slice(plaintext);
+    record.extend_from_slice(&tag);
     cipher.commit(plaintext.len(), handshake_hash)?;
-    Ok(record)
+    Ok(())
 }
 
 async fn read_frame(
     reader: &mut OwnedReadHalf,
     cipher: &mut CipherState,
     handshake_hash: &[u8; 32],
+    zstd: &mut zstd::bulk::Decompressor<'_>,
+    record: &mut Vec<u8>,
 ) -> io::Result<Option<Frame>> {
     let mut size = [0u8; 4];
     reader.read_exact(&mut size).await?;
@@ -623,8 +768,9 @@ async fn read_frame(
     if length < 8 + TAG_LEN || length > max_record_len() {
         return Err(invalid_data("invalid MST5 encrypted record length"));
     }
-    let mut record = vec![0u8; length];
-    reader.read_exact(&mut record).await?;
+    record.clear();
+    record.resize(length, 0);
+    reader.read_exact(&mut *record).await?;
     let sequence = u64::from_be_bytes(
         record[..8]
             .try_into()
@@ -640,7 +786,7 @@ async fn read_frame(
     let decoded = parse_transport_plaintext(&plaintext)?;
     cipher.commit(plaintext.len(), handshake_hash)?;
     match decoded {
-        Record::Application(payload) => Frame::decode(&payload).map(Some),
+        Record::Application(payload) => Frame::decode_with_zstd(&payload, zstd).map(Some),
         Record::Close => Ok(None),
     }
 }
