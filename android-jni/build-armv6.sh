@@ -24,9 +24,11 @@ rustup target add arm-linux-androideabi --toolchain nightly
 rustup component add rust-src --toolchain nightly
 
 unwind_dir="${ndk_root}/sources/cxx-stl/llvm-libc++/libs/armeabi"
+armv6_cflags="${CFLAGS_arm_linux_androideabi:-} -std=gnu99"
 env \
   CC_arm_linux_androideabi="${toolchain}/bin/arm-linux-androideabi-gcc" \
   AR_arm_linux_androideabi="${toolchain}/bin/arm-linux-androideabi-ar" \
+  CFLAGS_arm_linux_androideabi="${armv6_cflags}" \
   CARGO_TARGET_ARM_LINUX_ANDROIDEABI_LINKER="${toolchain}/bin/arm-linux-androideabi-gcc" \
   CARGO_PROFILE_RELEASE_PANIC=abort \
   RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=arm1176jzf-s -C panic=abort -L native=${unwind_dir}" \
@@ -55,6 +57,7 @@ if [[ -n "${cabi_output_dir}" ]]; then
   env \
     CC_arm_linux_androideabi="${toolchain}/bin/arm-linux-androideabi-gcc" \
     AR_arm_linux_androideabi="${toolchain}/bin/arm-linux-androideabi-ar" \
+    CFLAGS_arm_linux_androideabi="${armv6_cflags}" \
     CARGO_TARGET_ARM_LINUX_ANDROIDEABI_LINKER="${toolchain}/bin/arm-linux-androideabi-gcc" \
     CARGO_PROFILE_RELEASE_PANIC=abort \
     RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=arm1176jzf-s -C panic=abort -L native=${unwind_dir}" \
