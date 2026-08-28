@@ -12,11 +12,13 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
 };
+use flate2::read::DeflateDecoder;
 use hkdf::Hkdf;
 use js_sys::Uint8Array;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::io::Read;
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestInit, Response};
@@ -62,6 +64,7 @@ const REQUIRED_MEDIA_FEATURES: u64 = FEATURE_STRUCTURED_ERRORS | FEATURE_MEDIA_S
 // relying on the media node's much larger 256 KiB native-TCP chunk size.
 const BROWSER_MEDIA_CHUNK: usize = 16 * 1024;
 const MST5_KIND_AUTH: u8 = 1;
+const MST5_FLAG_DEFLATE: u8 = 1;
 const MST5_KIND_RESULT: u8 = 4;
 const MST5_KIND_ACK: u8 = 6;
 const MST5_KIND_ERROR: u8 = 7;
@@ -213,6 +216,23 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn deflate_result_frames_are_decoded_with_a_bound() {
+        let plain = b"chat list ".repeat(1024);
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &plain).expect("compress frame payload");
+        let compressed = encoder.finish().expect("finish compressed frame payload");
+        let mut frame = Vec::with_capacity(40 + compressed.len());
+        frame.extend_from_slice(&[MST5_KIND_RESULT, MST5_FLAG_DEFLATE]);
+        frame.extend_from_slice(&200u16.to_be_bytes());
+        frame.extend_from_slice(&7u64.to_be_bytes());
+        frame.extend_from_slice(&[0; 16]);
+        frame.extend_from_slice(&0u64.to_be_bytes());
+        frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&compressed);
+        assert_eq!(frame_decode(&frame).expect("decode compressed frame").payload, plain);
     }
 }
 
@@ -963,8 +983,12 @@ fn frame_encode(kind: u8, code: u16, id: u64, payload: &[u8]) -> Result<Vec<u8>,
     Ok(out)
 }
 fn frame_decode(input: &[u8]) -> Result<Frame, JsValue> {
-    if input.len() < 40 || input[1] != 0 {
+    if input.len() < 40 {
         return Err(JsValue::from_str("invalid MST5 frame"));
+    }
+    let flags = input[1];
+    if flags & !MST5_FLAG_DEFLATE != 0 {
+        return Err(JsValue::from_str("unsupported MST5 frame compression"));
     }
     let size = u32::from_be_bytes(
         input[36..40]
@@ -974,6 +998,20 @@ fn frame_decode(input: &[u8]) -> Result<Frame, JsValue> {
     if input.len() != 40 + size {
         return Err(JsValue::from_str("invalid MST5 frame size"));
     }
+    let payload = if flags == MST5_FLAG_DEFLATE {
+        let decoder = DeflateDecoder::new(&input[40..]);
+        let mut output = Vec::new();
+        decoder
+            .take((MAX_RECORD_BYTES + 1) as u64)
+            .read_to_end(&mut output)
+            .map_err(|_| JsValue::from_str("invalid MST5 deflate payload"))?;
+        if output.len() > MAX_RECORD_BYTES {
+            return Err(JsValue::from_str("MST5 deflate payload exceeds the frame limit"));
+        }
+        output
+    } else {
+        input[40..].to_vec()
+    };
     Ok(Frame {
         kind: input[0],
         code: u16::from_be_bytes([input[2], input[3]]),
@@ -982,7 +1020,7 @@ fn frame_decode(input: &[u8]) -> Result<Frame, JsValue> {
                 .try_into()
                 .map_err(|_| JsValue::from_str("invalid MST5 frame id"))?,
         ),
-        payload: input[40..].to_vec(),
+        payload,
     })
 }
 
