@@ -153,6 +153,13 @@ mod tests {
         let query = frame_encode(3, 49, 8, b"").expect("query frame");
         assert!(query[12..28].iter().all(|byte| *byte == 0));
     }
+
+    #[test]
+    fn hello_accepts_a_hello_response() {
+        assert!(successful_response(11, 11, 200));
+        assert!(!successful_response(11, 4, 200));
+        assert!(successful_response(2, 4, 201));
+    }
 }
 
 #[derive(Clone)]
@@ -399,7 +406,7 @@ impl BrowserSession {
             }
             let value: JsonValue = serde_cbor::from_slice(&decoded.payload)
                 .map_err(|_| JsValue::from_str("invalid CBOR response"))?;
-            let ok = decoded.kind == 4 && (200..300).contains(&decoded.code);
+            let ok = successful_response(kind, decoded.kind, decoded.code);
             let reason = value
                 .get("message")
                 .and_then(JsonValue::as_str)
@@ -689,6 +696,14 @@ fn frame_decode(input: &[u8]) -> Result<Frame, JsValue> {
         ),
         payload: input[40..].to_vec(),
     })
+}
+
+fn successful_response(request_kind: u8, response_kind: u8, code: u16) -> bool {
+    // HELLO is acknowledged with another HELLO frame; all remaining request
+    // types use RESULT. Treating negotiation as RESULT made valid browser
+    // M5oHS sessions fail before authentication.
+    let expected_kind = if request_kind == 11 { 11 } else { 4 };
+    response_kind == expected_kind && (200..300).contains(&code)
 }
 
 fn aead_nonce(value: u64) -> [u8; 12] {
