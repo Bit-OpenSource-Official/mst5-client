@@ -1,6 +1,6 @@
 [package]
 name = "mst5-client-wasm"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Browser M5oHS transport for mst5-client"

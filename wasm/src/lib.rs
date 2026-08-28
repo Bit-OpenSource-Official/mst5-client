@@ -141,6 +141,20 @@ impl M5ohFetch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_have_an_idempotency_nonce() {
+        let command = frame_encode(2, 40, 7, b"payload").expect("command frame");
+        assert!(command[12..28].iter().any(|byte| *byte != 0));
+
+        let query = frame_encode(3, 49, 8, b"").expect("query frame");
+        assert!(query[12..28].iter().all(|byte| *byte == 0));
+    }
+}
+
 #[derive(Clone)]
 struct CipherState {
     key: [u8; 32],
@@ -636,11 +650,18 @@ fn frame_encode(kind: u8, code: u16, id: u64, payload: &[u8]) -> Result<Vec<u8>,
         return Err(JsValue::from_str("MST5 frame too large"));
     }
     let mut out = Vec::with_capacity(40 + payload.len());
+    let mut request_nonce = [0u8; 16];
+    // COMMANDs are idempotency-protected by the server. Queries, auth and
+    // stream frames intentionally retain an all-zero nonce.
+    if kind == 2 {
+        getrandom::fill(&mut request_nonce)
+            .map_err(|_| JsValue::from_str("browser random generator is unavailable"))?;
+    }
     out.push(kind);
     out.push(0);
     out.extend_from_slice(&code.to_be_bytes());
     out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&[0; 16]);
+    out.extend_from_slice(&request_nonce);
     out.extend_from_slice(&0u64.to_be_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
