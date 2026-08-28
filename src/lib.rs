@@ -879,6 +879,11 @@ impl Client {
         options: ClientOptions,
     ) -> io::Result<Self> {
         let endpoint = parse_endpoint(endpoint)?;
+        // Raw MST5 reaches a multiplexer and therefore needs its binary route
+        // preface. M5oH is already routed by its HTTP Host/route headers; the
+        // bridge is connected directly to the selected upstream and must begin
+        // with the Noise handshake.
+        let m5oh = endpoint.m5oh.is_some();
         let mut stream = match endpoint.m5oh.as_ref() {
             Some(endpoint) => {
                 m5oh::open_loopback_bridge(endpoint.clone(), options.connect_timeout).await?
@@ -893,8 +898,10 @@ impl Client {
             }
         };
         stream.set_nodelay(options.nodelay)?;
-        if let Some(route) = endpoint.route.as_deref() {
-            write_router_preface(&mut stream, route, options.write_timeout).await?;
+        if !m5oh {
+            if let Some(route) = endpoint.route.as_deref() {
+                write_router_preface(&mut stream, route, options.write_timeout).await?;
+            }
         }
         let mut session = client_handshake(
             &mut stream,
@@ -3675,6 +3682,25 @@ struct ParsedEndpoint {
 
 fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
     let value = endpoint.trim().trim_end_matches('/');
+    // M5oH is an ordinary HTTP(S) request at the network boundary.  Keep the
+    // historical `m5oh` schemes below for saved configurations, but never
+    // reinterpret an `http://` endpoint as a raw TCP socket.
+    if let Some(address) = value.strip_prefix("https://") {
+        let (endpoint, route) = parse_m5oh_endpoint(address, 443, true)?;
+        return Ok(ParsedEndpoint {
+            address: String::new(),
+            route,
+            m5oh: Some(endpoint),
+        });
+    }
+    if let Some(address) = value.strip_prefix("http://") {
+        let (endpoint, route) = parse_m5oh_endpoint(address, 80, false)?;
+        return Ok(ParsedEndpoint {
+            address: String::new(),
+            route,
+            m5oh: Some(endpoint),
+        });
+    }
     if let Some(address) = value.strip_prefix("m5ohs://") {
         let (endpoint, route) = parse_m5oh_endpoint(address, 443, true)?;
         return Ok(ParsedEndpoint {
@@ -3691,9 +3717,9 @@ fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
             m5oh: Some(endpoint),
         });
     }
-    if value.starts_with("https://") || value.starts_with("tcps://") {
+    if value.starts_with("tcps://") {
         return Err(invalid_input(
-            "MST5 endpoint must use tcp://host:port, mst5://host:port/route, m5oh://host, or m5ohs://host",
+            "MST5 endpoint must use tcp://host:port, mst5://host:port/route, http://host, or https://host",
         ));
     }
     if let Some(routed) = value.strip_prefix("mst5://") {
@@ -3707,10 +3733,7 @@ fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
             m5oh: None,
         });
     }
-    let value = value
-        .strip_prefix("tcp://")
-        .or_else(|| value.strip_prefix("http://"))
-        .unwrap_or(value);
+    let value = value.strip_prefix("tcp://").unwrap_or(value);
     if value.is_empty() || value.contains('/') {
         return Err(invalid_input("invalid MST5 endpoint"));
     }
@@ -4129,7 +4152,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_endpoint("m5oh://central-1-cdn.ms.sectorlambda.ru/main").unwrap(),
+            parse_endpoint("http://central-1-cdn.ms.sectorlambda.ru/main").unwrap(),
             ParsedEndpoint {
                 address: String::new(),
                 route: Some("main".to_string()),

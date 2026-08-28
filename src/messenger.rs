@@ -57,7 +57,10 @@ pub fn select_endpoint(configured: &str, mode: TransportMode) -> io::Result<Stri
 
     let is_m5oh = |value: &&str| {
         let lower = value.to_ascii_lowercase();
-        lower.starts_with("m5oh://") || lower.starts_with("m5ohs://")
+        lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("m5oh://")
+            || lower.starts_with("m5ohs://")
     };
     let selected: Vec<&str> = match mode {
         TransportMode::Auto => candidates
@@ -533,13 +536,13 @@ fn validate_session_values(values: &BTreeMap<String, String>) -> io::Result<()> 
 mod tests {
     use super::*;
 
-    const CHAIN: &str = "m5oh://cdn.example/main|mst5://central.example:8067/main";
+    const CHAIN: &str = "http://cdn.example/main|mst5://central.example:8067/main";
 
     #[test]
     fn auto_always_prefers_mst5() {
         assert_eq!(
             select_endpoint(CHAIN, TransportMode::Auto).unwrap(),
-            "mst5://central.example:8067/main|m5oh://cdn.example/main"
+            "mst5://central.example:8067/main|http://cdn.example/main"
         );
     }
 
@@ -547,7 +550,7 @@ mod tests {
     fn forced_transport_does_not_fall_back() {
         assert_eq!(
             select_endpoint(CHAIN, TransportMode::M5oh).unwrap(),
-            "m5oh://cdn.example/main"
+            "http://cdn.example/main"
         );
         assert!(select_endpoint("mst5://central.example:8067/main", TransportMode::M5oh).is_err());
     }
