@@ -305,7 +305,6 @@ impl Mst5Web {
         let mut session = establish_session(
             endpoint,
             destination,
-            EMBEDDED_ACCOUNT_PUBLIC_KEY.to_owned(),
         )
         .await?;
         authenticate_session(&mut session, token, device_model).await?;
@@ -327,7 +326,6 @@ impl Mst5Web {
         let mut session = establish_session(
             endpoint,
             destination,
-            EMBEDDED_ACCOUNT_PUBLIC_KEY.to_owned(),
         )
         .await?;
         authenticate_session(&mut session, String::new(), device_model).await?;
@@ -393,7 +391,6 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
-        server_public_key_b64: String,
         ticket: String,
         file_id: String,
         data: Uint8Array,
@@ -409,7 +406,6 @@ impl Mst5Web {
         let mut session = establish_session_with_features(
             m5ohs_endpoint,
             destination,
-            server_public_key_b64,
             REQUIRED_MEDIA_FEATURES,
         )
         .await?;
@@ -424,7 +420,6 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
-        server_public_key_b64: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -440,7 +435,6 @@ impl Mst5Web {
         let mut session = establish_session_with_features(
             m5ohs_endpoint,
             destination,
-            server_public_key_b64,
             REQUIRED_MEDIA_FEATURES,
         )
         .await?;
@@ -459,7 +453,6 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
-        server_public_key_b64: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -480,7 +473,6 @@ impl Mst5Web {
         let mut session = establish_session_with_features(
             m5ohs_endpoint,
             destination,
-            server_public_key_b64,
             REQUIRED_MEDIA_FEATURES,
         )
         .await?;
@@ -542,12 +534,10 @@ impl Mst5MediaUpload {
 async fn establish_session(
     endpoint: String,
     destination: String,
-    server_public_key_b64: String,
 ) -> Result<BrowserSession, JsValue> {
     establish_session_with_features(
         endpoint,
         destination,
-        server_public_key_b64,
         REQUIRED_FEATURES,
     )
     .await
@@ -556,12 +546,11 @@ async fn establish_session(
 async fn establish_session_with_features(
     endpoint: String,
     destination: String,
-    server_public_key_b64: String,
     required_features: u64,
 ) -> Result<BrowserSession, JsValue> {
     let (ip, port) = parse_destination(&destination)?;
     let route = encode_route(ip.to_string(), port, 0)?;
-    let key = decode_server_key(&server_public_key_b64)?;
+    let key = decode_server_key(EMBEDDED_ACCOUNT_PUBLIC_KEY)?;
     let transport = M5ohFetch::new(endpoint, route)?;
     let tunnel_id = browser_tunnel_id()?;
     // seq=0 makes the router establish its upstream TCP connection before
