@@ -48,12 +48,26 @@ const FEATURE_CBOR_QUERY: u64 = 1 << 2;
 const FEATURE_IDEMPOTENCY: u64 = 1 << 3;
 const FEATURE_DEADLINE: u64 = 1 << 4;
 const FEATURE_CANCEL: u64 = 1 << 5;
+const FEATURE_MEDIA_STREAMS: u64 = 1 << 6;
 const REQUIRED_FEATURES: u64 = FEATURE_MULTIPLEX
     | FEATURE_STRUCTURED_ERRORS
     | FEATURE_CBOR_QUERY
     | FEATURE_IDEMPOTENCY
     | FEATURE_DEADLINE
     | FEATURE_CANCEL;
+const REQUIRED_MEDIA_FEATURES: u64 = FEATURE_STRUCTURED_ERRORS | FEATURE_MEDIA_STREAMS;
+// A M5oH upstream request has a 23 KiB envelope cap.  Leave ample room for
+// the frame header, encrypted record header/tag and padding instead of
+// relying on the media node's much larger 256 KiB native-TCP chunk size.
+const BROWSER_MEDIA_CHUNK: usize = 16 * 1024;
+const MST5_KIND_AUTH: u8 = 1;
+const MST5_KIND_RESULT: u8 = 4;
+const MST5_KIND_ACK: u8 = 6;
+const MST5_KIND_HELLO: u8 = 11;
+const MST5_KIND_STREAM_OPEN: u8 = 14;
+const MST5_KIND_STREAM_DATA: u8 = 15;
+const MST5_KIND_STREAM_END: u8 = 16;
+const MEDIA_OP_UPLOAD: u16 = 1;
 
 /// Encodes the opaque eight byte node selector exactly as the router expects.
 /// The byte permutation prevents the route's port and address from being
@@ -159,6 +173,15 @@ mod tests {
         assert!(successful_response(11, 11, 200));
         assert!(!successful_response(11, 4, 200));
         assert!(successful_response(2, 4, 201));
+    }
+
+    #[test]
+    fn browser_tunnel_ids_match_the_router_contract() {
+        let id = browser_tunnel_id().expect("browser tunnel id");
+        assert_eq!(id.len(), 32);
+        assert!(id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     }
 }
 
@@ -278,6 +301,39 @@ impl Mst5Web {
             .map_err(|_| JsValue::from_str("cannot return MST5 response"))
     }
 
+    /// Uploads a media object over a separate encrypted MST5 media stream.
+    /// `media_endpoint` is the server-provided `raw|m5oh` endpoint; the raw
+    /// endpoint is never used by a browser.  Its M5oH fallback carries only
+    /// the opaque router destination, while requests go to `m5ohs_endpoint`.
+    #[wasm_bindgen]
+    pub async fn upload_media(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        server_public_key_b64: String,
+        ticket: String,
+        file_id: String,
+        data: Uint8Array,
+    ) -> Result<(), JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || data.length() == 0 {
+            return Err(JsValue::from_str(
+                "media ticket, file id and data are required",
+            ));
+        }
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut bytes = vec![0; data.length() as usize];
+        data.copy_to(&mut bytes);
+        let mut session = establish_session_with_features(
+            m5ohs_endpoint,
+            destination,
+            server_public_key_b64,
+            REQUIRED_MEDIA_FEATURES,
+        )
+        .await?;
+        media_authenticate(&mut session, ticket).await?;
+        session.upload_media(&file_id, &bytes).await
+    }
+
     #[wasm_bindgen]
     pub async fn close(&self) -> Result<(), JsValue> {
         *self.inner.borrow_mut() = None;
@@ -290,20 +346,61 @@ async fn establish_session(
     destination: String,
     server_public_key_b64: String,
 ) -> Result<BrowserSession, JsValue> {
+    establish_session_with_features(
+        endpoint,
+        destination,
+        server_public_key_b64,
+        REQUIRED_FEATURES,
+    )
+    .await
+}
+
+async fn establish_session_with_features(
+    endpoint: String,
+    destination: String,
+    server_public_key_b64: String,
+    required_features: u64,
+) -> Result<BrowserSession, JsValue> {
     let (ip, port) = parse_destination(&destination)?;
     let route = encode_route(ip.to_string(), port, 0)?;
     let key = decode_server_key(&server_public_key_b64)?;
     let transport = M5ohFetch::new(endpoint, route)?;
-    let mut random = [0u8; 18];
-    getrandom::fill(&mut random)
-        .map_err(|_| JsValue::from_str("browser random generator is unavailable"))?;
-    let tunnel_id = URL_SAFE_NO_PAD.encode(random);
+    let tunnel_id = browser_tunnel_id()?;
     // seq=0 makes the router establish its upstream TCP connection before
     // the Noise initiator sends a byte.
     transport.upstream_bytes(&tunnel_id, 0, &[], false).await?;
     let mut session = handshake(transport, tunnel_id, key).await?;
-    session.negotiate().await?;
+    session.negotiate(required_features).await?;
     Ok(session)
+}
+
+/// The shared router deliberately accepts only a canonical 128-bit lowercase
+/// hexadecimal session id.  It keeps this HTTP identifier separate from the
+/// opaque route and encrypted MST5 data, so it remains safe to use in headers
+/// and compatible with the native M5oH transport.
+fn browser_tunnel_id() -> Result<String, JsValue> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| JsValue::from_str("browser random generator is unavailable"))?;
+    Ok(hex_bytes(&random))
+}
+
+async fn media_authenticate(session: &mut BrowserSession, ticket: String) -> Result<(), JsValue> {
+    let result = session
+        .request(
+            MST5_KIND_AUTH,
+            0,
+            serde_json::json!({"mechanism": "media_ticket", "ticket": ticket}),
+        )
+        .await?;
+    if result.0 {
+        Ok(())
+    } else {
+        Err(JsValue::from_str(&format!(
+            "MST5 media authentication failed: {}",
+            result.1
+        )))
+    }
 }
 
 async fn authenticate_session(
@@ -333,7 +430,7 @@ async fn authenticate_session(
 }
 
 impl BrowserSession {
-    async fn negotiate(&mut self) -> Result<(), JsValue> {
+    async fn negotiate(&mut self, required_features: u64) -> Result<(), JsValue> {
         let payload = JsonValue::Object(JsonMap::from_iter([
             (
                 "transport_major".to_owned(),
@@ -341,10 +438,10 @@ impl BrowserSession {
             ),
             ("rpc_major".to_owned(), JsonValue::from(RPC_MAJOR)),
             ("rpc_minor".to_owned(), JsonValue::from(RPC_MINOR)),
-            ("features".to_owned(), JsonValue::from(REQUIRED_FEATURES)),
+            ("features".to_owned(), JsonValue::from(required_features)),
             (
                 "required_features".to_owned(),
-                JsonValue::from(REQUIRED_FEATURES),
+                JsonValue::from(required_features),
             ),
             (
                 "max_frame".to_owned(),
@@ -368,8 +465,8 @@ impl BrowserSession {
                 .get("features")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0)
-                & REQUIRED_FEATURES
-                != REQUIRED_FEATURES
+                & required_features
+                != required_features
         {
             return Err(JsValue::from_str(
                 "MST5 SERVER_HELLO omitted required capabilities",
@@ -378,42 +475,98 @@ impl BrowserSession {
         Ok(())
     }
 
+    async fn upload_media(&mut self, file_id: &str, data: &[u8]) -> Result<(), JsValue> {
+        let id = self.take_request_id()?;
+        let payload =
+            serde_cbor::to_vec(&serde_json::json!({"file_id": file_id, "size": data.len()}))
+                .map_err(|_| JsValue::from_str("cannot encode media stream open"))?;
+        self.write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_UPLOAD, id, &payload)
+            .await?;
+        let accepted = self.read_matching_frame(id).await?;
+        if accepted.kind != MST5_KIND_ACK || accepted.code != 100 {
+            return Err(frame_error("media upload was rejected", &accepted));
+        }
+        let details: JsonValue = serde_cbor::from_slice(&accepted.payload)
+            .map_err(|_| JsValue::from_str("invalid media upload acknowledgement"))?;
+        let server_chunk = details
+            .get("chunk_size")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0) as usize;
+        if server_chunk == 0 {
+            return Err(JsValue::from_str("media node did not provide a chunk size"));
+        }
+        let chunk = BROWSER_MEDIA_CHUNK.min(server_chunk);
+        let mut digest = Sha256::new();
+        for bytes in data.chunks(chunk) {
+            digest.update(bytes);
+            self.write_frame(MST5_KIND_STREAM_DATA, 0, id, bytes)
+                .await?;
+        }
+        let checksum = hex_bytes(&digest.finalize());
+        let end = serde_cbor::to_vec(&serde_json::json!({"size": data.len(), "sha256": checksum}))
+            .map_err(|_| JsValue::from_str("cannot encode media stream end"))?;
+        self.write_frame(MST5_KIND_STREAM_END, 200, id, &end)
+            .await?;
+        let result = self.read_matching_frame(id).await?;
+        if result.kind != MST5_KIND_RESULT || !(200..300).contains(&result.code) {
+            return Err(frame_error("media upload failed", &result));
+        }
+        Ok(())
+    }
+
+    fn take_request_id(&mut self) -> Result<u64, JsValue> {
+        let id = self.next_request;
+        self.next_request = self
+            .next_request
+            .checked_add(1)
+            .ok_or_else(|| JsValue::from_str("MST5 request id exhausted"))?;
+        Ok(id)
+    }
+
+    async fn write_frame(
+        &mut self,
+        kind: u8,
+        code: u16,
+        id: u64,
+        payload: &[u8],
+    ) -> Result<(), JsValue> {
+        let frame = frame_encode(kind, code, id, payload)?;
+        self.write_record(&frame).await
+    }
+
+    async fn read_matching_frame(&mut self, id: u64) -> Result<Frame, JsValue> {
+        loop {
+            let frame = frame_decode(&self.read_record().await?)?;
+            if frame.id == id {
+                return Ok(frame);
+            }
+        }
+    }
+
     async fn request(
         &mut self,
         kind: u8,
         code: u16,
         body: JsonValue,
     ) -> Result<(bool, String, JsonValue), JsValue> {
-        let id = if kind == 11 {
+        let id = if kind == MST5_KIND_HELLO {
             0
         } else {
-            let value = self.next_request;
-            self.next_request = self
-                .next_request
-                .checked_add(1)
-                .ok_or_else(|| JsValue::from_str("MST5 request id exhausted"))?;
-            value
+            self.take_request_id()?
         };
         let payload = serde_cbor::to_vec(&body)
             .map_err(|_| JsValue::from_str("cannot encode MST5 command"))?;
-        let frame = frame_encode(kind, code, id, &payload)?;
-        self.write_record(&frame).await?;
-        loop {
-            let frame = self.read_record().await?;
-            let decoded = frame_decode(&frame)?;
-            if decoded.id != id {
-                continue;
-            }
-            let value: JsonValue = serde_cbor::from_slice(&decoded.payload)
-                .map_err(|_| JsValue::from_str("invalid CBOR response"))?;
-            let ok = successful_response(kind, decoded.kind, decoded.code);
-            let reason = value
-                .get("message")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("MST5 request failed")
-                .to_owned();
-            return Ok((ok, reason, value));
-        }
+        self.write_frame(kind, code, id, &payload).await?;
+        let decoded = self.read_matching_frame(id).await?;
+        let value: JsonValue = serde_cbor::from_slice(&decoded.payload)
+            .map_err(|_| JsValue::from_str("invalid CBOR response"))?;
+        let ok = successful_response(kind, decoded.kind, decoded.code);
+        let reason = value
+            .get("message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("MST5 request failed")
+            .to_owned();
+        Ok((ok, reason, value))
     }
 
     async fn write_record(&mut self, frame: &[u8]) -> Result<(), JsValue> {
@@ -706,6 +859,29 @@ fn successful_response(request_kind: u8, response_kind: u8, code: u16) -> bool {
     response_kind == expected_kind && (200..300).contains(&code)
 }
 
+fn frame_error(context: &str, frame: &Frame) -> JsValue {
+    let message = serde_cbor::from_slice::<JsonValue>(&frame.payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("MST5 status {}", frame.code));
+    JsValue::from_str(&format!("{context}: {message}"))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn aead_nonce(value: u64) -> [u8; 12] {
     let mut out = [0; 12];
     out[4..].copy_from_slice(&value.to_le_bytes());
@@ -776,6 +952,31 @@ fn parse_destination(value: &str) -> Result<(&str, u16), JsValue> {
         port.parse()
             .map_err(|_| JsValue::from_str("invalid M5oH port"))?,
     ))
+}
+
+/// Browser media endpoints retain the native endpoint first and append a
+/// router fallback (`mst5://…|http(s)://router/IPv4:port`).  Deliberately
+/// consume only the fallback path; a web page must never attempt the raw TCP
+/// endpoint or expose it as a fetch target.
+fn parse_media_destination(value: &str) -> Result<String, JsValue> {
+    let fallback = value
+        .split('|')
+        .map(str::trim)
+        .find(|item| item.starts_with("http://") || item.starts_with("https://"))
+        .ok_or_else(|| JsValue::from_str("media node has no browser M5oH endpoint"))?;
+    let after_scheme = fallback
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| JsValue::from_str("invalid browser media endpoint"))?;
+    let (_, path) = after_scheme
+        .split_once('/')
+        .ok_or_else(|| JsValue::from_str("browser media endpoint lacks a destination"))?;
+    let destination = path.split(['/', '?', '#']).next().unwrap_or_default();
+    let (ip, port) = parse_destination(destination)?;
+    if ip.split('.').count() != 4 || ip.split('.').any(|part| part.parse::<u8>().is_err()) {
+        return Err(JsValue::from_str("browser media destination must be IPv4"));
+    }
+    Ok(format!("{ip}:{port}"))
 }
 
 // Keep this ABI mapping in the SDK boundary. Web UI code uses paths only,
