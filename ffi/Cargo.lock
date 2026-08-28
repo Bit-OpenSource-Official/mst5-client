@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-client"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "argon2",
  "bytes",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-client-ffi"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "cc",
  "mst5-client",

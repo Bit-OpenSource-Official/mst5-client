@@ -32,6 +32,15 @@ jobs:
             -Wl,-rpath,"$PWD/ffi/target/release" -lmst5_client_ffi -o /tmp/mst5-smoke
           /tmp/mst5-smoke
 
+  wasm-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check --locked --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
+
   version:
     if: startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-latest
@@ -48,11 +57,11 @@ jobs:
           [[ "$version" == "$crate" && "$version" == "$ffi" && "$version" == "$wasm" ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-  # This is intentionally an independent target: browser packaging must not
-  # wait for the Apple or Android matrices.  The resulting archive contains
-  # ESM glue and the wasm binary, ready to be served by a web client.
+  # Browser packaging is a required member of every release, just like the
+  # native platform archives.  The resulting archive contains ESM glue and
+  # the wasm binary, ready to be served by a web client.
   wasm:
-    needs: [test, version]
+    needs: [test, wasm-check, version]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +69,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: v0.14.0
       - name: Build browser package
         run: |
           rm -rf dist/wasm
