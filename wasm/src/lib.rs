@@ -201,7 +201,18 @@ mod tests {
         // Keep the browser ABI in sync with micromsg/src/mst5.rs. These used
         // to be shifted by two after the server reserved operations 48 and 49,
         // which made a successful browser login fail immediately on /chats.
+        // Cover every route used by the web client, including the separate
+        // prepare/upload/commit media sequence.
         for ((method, path), expected) in [
+            (("POST", "/register"), 1),
+            (("POST", "/login"), 2),
+            (("GET", "/me"), 5),
+            (("GET", "/sessions"), 24),
+            (("GET", "/wallet"), 34),
+            (("GET", "/wallet/history"), 36),
+            (("POST", "/send"), 40),
+            (("POST", "/reactions"), 43),
+            (("POST", "/read"), 45),
             (("GET", "/nodes/status"), 50),
             (("GET", "/chats"), 51),
             (("POST", "/chats/delete"), 52),
@@ -211,6 +222,9 @@ mod tests {
             (("GET", "/file/ticket"), 65),
             (("POST", "/forward"), 69),
             (("POST", "/media/quote"), 70),
+            (("POST", "/messages/prepare"), 71),
+            (("POST", "/messages/commit"), 72),
+            (("POST", "/messages/cancel"), 73),
         ] {
             assert_eq!(
                 operation(method, path).expect("registered operation"),
