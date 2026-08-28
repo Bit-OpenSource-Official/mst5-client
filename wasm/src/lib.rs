@@ -69,6 +69,7 @@ const MST5_KIND_STREAM_OPEN: u8 = 14;
 const MST5_KIND_STREAM_DATA: u8 = 15;
 const MST5_KIND_STREAM_END: u8 = 16;
 const MEDIA_OP_UPLOAD: u16 = 1;
+const EMBEDDED_ACCOUNT_PUBLIC_KEY: &str = env!("CRYPT_SERVER_PUBLIC_KEY_B64");
 
 /// Encodes the opaque eight byte node selector exactly as the router expects.
 /// The byte permutation prevents the route's port and address from being
@@ -225,11 +226,15 @@ impl Mst5Web {
         &self,
         endpoint: String,
         destination: String,
-        server_public_key_b64: String,
         token: String,
         device_model: String,
     ) -> Result<(), JsValue> {
-        let mut session = establish_session(endpoint, destination, server_public_key_b64).await?;
+        let mut session = establish_session(
+            endpoint,
+            destination,
+            EMBEDDED_ACCOUNT_PUBLIC_KEY.to_owned(),
+        )
+        .await?;
         authenticate_session(&mut session, token, device_model).await?;
         *self.inner.borrow_mut() = Some(session);
         Ok(())
@@ -244,10 +249,14 @@ impl Mst5Web {
         &self,
         endpoint: String,
         destination: String,
-        server_public_key_b64: String,
         device_model: String,
     ) -> Result<(), JsValue> {
-        let mut session = establish_session(endpoint, destination, server_public_key_b64).await?;
+        let mut session = establish_session(
+            endpoint,
+            destination,
+            EMBEDDED_ACCOUNT_PUBLIC_KEY.to_owned(),
+        )
+        .await?;
         authenticate_session(&mut session, String::new(), device_model).await?;
         *self.inner.borrow_mut() = Some(session);
         Ok(())

@@ -6,17 +6,27 @@ fn main() {
     println!("cargo:rerun-if-env-changed={KEY_ENV}");
 
     let Ok(value) = env::var(KEY_ENV) else {
+        if env::var("PROFILE").as_deref() == Ok("release") {
+            panic!("{KEY_ENV} must be set for release builds");
+        }
         return;
     };
     let value = value.trim();
     if value.is_empty() {
         // GitHub does not expose repository secrets to untrusted pull request
         // workflows, where the workflow-level variable consequently is empty.
+        if env::var("PROFILE").as_deref() == Ok("release") {
+            panic!("{KEY_ENV} must not be empty for release builds");
+        }
         return;
     }
     if decoded_base64_len(value).ok() != Some(32) {
         panic!("{KEY_ENV} must be valid Base64 that decodes to exactly 32 bytes");
     }
+    // Explicitly forward the key into rustc. This makes the same immutable
+    // public pin available to every artifact that links mst5-client: native,
+    // FFI, Android JNI and all platform-specific library archives.
+    println!("cargo:rustc-env={KEY_ENV}={value}");
 }
 
 fn decoded_base64_len(value: &str) -> Result<usize, ()> {
