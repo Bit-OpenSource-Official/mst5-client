@@ -184,37 +184,26 @@ impl Mst5Web {
         token: String,
         device_model: String,
     ) -> Result<(), JsValue> {
-        let (ip, port) = parse_destination(&destination)?;
-        let route = encode_route(ip.to_string(), port, 0)?;
-        let key = decode_server_key(&server_public_key_b64)?;
-        let transport = M5ohFetch::new(endpoint, route)?;
-        let mut random = [0u8; 18];
-        getrandom::fill(&mut random)
-            .map_err(|_| JsValue::from_str("browser random generator is unavailable"))?;
-        let tunnel_id = URL_SAFE_NO_PAD.encode(random);
-        // seq=0 makes the router establish its upstream TCP connection before
-        // the Noise initiator sends a byte.
-        transport.upstream_bytes(&tunnel_id, 0, &[], false).await?;
-        let mut session = handshake(transport, tunnel_id, key).await?;
-        session.negotiate().await?;
-        let auth = JsonValue::Object(JsonMap::from_iter([
-            ("token".to_owned(), JsonValue::String(token)),
-            (
-                "client_name".to_owned(),
-                JsonValue::String("OVE Web".to_owned()),
-            ),
-            (
-                "device_model".to_owned(),
-                JsonValue::String(device_model.chars().take(128).collect()),
-            ),
-        ]));
-        let result = session.request(1, 0, auth).await?;
-        if !result.0 {
-            return Err(JsValue::from_str(&format!(
-                "MST5 authentication failed: {}",
-                result.1
-            )));
-        }
+        let mut session = establish_session(endpoint, destination, server_public_key_b64).await?;
+        authenticate_session(&mut session, token, device_model).await?;
+        *self.inner.borrow_mut() = Some(session);
+        Ok(())
+    }
+
+    /// Opens an authenticated encrypted transport with the server's anonymous
+    /// principal.  Only `/login`, `/register` and email-auth operations are
+    /// permitted until one of them succeeds; password input never crosses the
+    /// browser's plaintext HTTP boundary.
+    #[wasm_bindgen]
+    pub async fn connect_anonymous(
+        &self,
+        endpoint: String,
+        destination: String,
+        server_public_key_b64: String,
+        device_model: String,
+    ) -> Result<(), JsValue> {
+        let mut session = establish_session(endpoint, destination, server_public_key_b64).await?;
+        authenticate_session(&mut session, String::new(), device_model).await?;
         *self.inner.borrow_mut() = Some(session);
         Ok(())
     }
@@ -273,6 +262,53 @@ impl Mst5Web {
         *self.inner.borrow_mut() = None;
         Ok(())
     }
+}
+
+async fn establish_session(
+    endpoint: String,
+    destination: String,
+    server_public_key_b64: String,
+) -> Result<BrowserSession, JsValue> {
+    let (ip, port) = parse_destination(&destination)?;
+    let route = encode_route(ip.to_string(), port, 0)?;
+    let key = decode_server_key(&server_public_key_b64)?;
+    let transport = M5ohFetch::new(endpoint, route)?;
+    let mut random = [0u8; 18];
+    getrandom::fill(&mut random)
+        .map_err(|_| JsValue::from_str("browser random generator is unavailable"))?;
+    let tunnel_id = URL_SAFE_NO_PAD.encode(random);
+    // seq=0 makes the router establish its upstream TCP connection before
+    // the Noise initiator sends a byte.
+    transport.upstream_bytes(&tunnel_id, 0, &[], false).await?;
+    let mut session = handshake(transport, tunnel_id, key).await?;
+    session.negotiate().await?;
+    Ok(session)
+}
+
+async fn authenticate_session(
+    session: &mut BrowserSession,
+    token: String,
+    device_model: String,
+) -> Result<(), JsValue> {
+    let auth = JsonValue::Object(JsonMap::from_iter([
+        ("token".to_owned(), JsonValue::String(token)),
+        (
+            "client_name".to_owned(),
+            JsonValue::String("OVE Web".to_owned()),
+        ),
+        (
+            "device_model".to_owned(),
+            JsonValue::String(device_model.chars().take(128).collect()),
+        ),
+    ]));
+    let result = session.request(1, 0, auth).await?;
+    if !result.0 {
+        return Err(JsValue::from_str(&format!(
+            "MST5 authentication failed: {}",
+            result.1
+        )));
+    }
+    Ok(())
 }
 
 impl BrowserSession {
