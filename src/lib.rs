@@ -3750,8 +3750,18 @@ fn parse_m5oh_endpoint(
     tls: bool,
 ) -> io::Result<(m5oh::Endpoint, Option<String>)> {
     let (address, route) = match value.split_once('/') {
+        Some((address, "")) => (address, None),
         Some((address, route)) => {
-            validate_route_id(route)?;
+            // `IPv4:port` selects the opaque packet route. Other route IDs
+            // remain supported temporarily for saved endpoints.
+            if route
+                .parse::<std::net::SocketAddrV4>()
+                .ok()
+                .filter(|address| address.port() != 0)
+                .is_none()
+            {
+                validate_route_id(route)?;
+            }
             (address, Some(route.to_string()))
         }
         None => (value, None),
@@ -3797,6 +3807,10 @@ fn parse_m5oh_endpoint(
             port,
             tls,
             route: route.clone(),
+            packet_destination: route
+                .as_deref()
+                .and_then(|route| route.parse::<std::net::SocketAddrV4>().ok())
+                .filter(|address| address.port() != 0),
         },
         route,
     ))
@@ -4147,7 +4161,22 @@ mod tests {
                     host: "m5oh.ms.ove.rs".to_string(),
                     port: 443,
                     tls: true,
-                    route: None
+                    route: None,
+                    packet_destination: None,
+                }),
+            }
+        );
+        assert_eq!(
+            parse_endpoint("http://central-1-cdn.ms.sectorlambda.ru/").unwrap(),
+            ParsedEndpoint {
+                address: String::new(),
+                route: None,
+                m5oh: Some(m5oh::Endpoint {
+                    host: "central-1-cdn.ms.sectorlambda.ru".to_string(),
+                    port: 80,
+                    tls: false,
+                    route: None,
+                    packet_destination: None,
                 }),
             }
         );
@@ -4161,6 +4190,21 @@ mod tests {
                     port: 80,
                     tls: false,
                     route: Some("main".to_string()),
+                    packet_destination: None,
+                }),
+            }
+        );
+        assert_eq!(
+            parse_endpoint("http://central-1-cdn.ms.sectorlambda.ru/10.100.2.228:8080").unwrap(),
+            ParsedEndpoint {
+                address: String::new(),
+                route: Some("10.100.2.228:8080".to_string()),
+                m5oh: Some(m5oh::Endpoint {
+                    host: "central-1-cdn.ms.sectorlambda.ru".to_string(),
+                    port: 80,
+                    tls: false,
+                    route: Some("10.100.2.228:8080".to_string()),
+                    packet_destination: Some("10.100.2.228:8080".parse().unwrap()),
                 }),
             }
         );

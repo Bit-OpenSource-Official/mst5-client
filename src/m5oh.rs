@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddrV4;
 use std::pin::Pin;
 #[cfg(feature = "m5oh-tls")]
 use std::sync::Arc;
@@ -29,11 +30,11 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
-// The CDN accepts at most the 31,407-byte request-target proven by Bit.Proxy.
-// Reserve 13 bytes for `/?m5=file-main&r=` (the longest current route), so
-// URL-safe Base64 never exceeds that limit.
-const UPLOAD_CHUNK: usize = 23 * 1024 - 10;
+// The CDN budget is 23 KiB per GET payload. Packet-routed M5oH reserves the
+// first eight bytes for the opaque node port carried inside `r`.
+const UPLOAD_CHUNK: usize = 23 * 1024 - 8;
 const UPLOAD_COALESCE: Duration = Duration::from_millis(2);
+const PACKET_ROUTE_DESTINATION_BYTES: usize = 8;
 // The production edge currently uses the project CA below rather than a
 // browser CA. Keep public WebPKI roots as well so independently hosted M5oH
 // domains can use ordinary public certificates.
@@ -45,6 +46,9 @@ pub(crate) struct Endpoint {
     pub(crate) port: u16,
     pub(crate) tls: bool,
     pub(crate) route: Option<String>,
+    /// New packet-routed M5oH. `None` retains legacy selectors or triggers
+    /// a node-directory lookup for a bare M5oH endpoint.
+    pub(crate) packet_destination: Option<SocketAddrV4>,
 }
 
 impl Endpoint {
@@ -120,6 +124,7 @@ pub(crate) async fn open_loopback_bridge(
     endpoint: Endpoint,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
+    let endpoint = discover_default_node(endpoint, connect_timeout).await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
@@ -131,6 +136,75 @@ pub(crate) async fn open_loopback_bridge(
     timeout(connect_timeout, TcpStream::connect(address))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "M5oH local bridge timed out"))?
+}
+
+#[derive(serde::Deserialize)]
+struct NodeDirectory {
+    version: u8,
+    nodes: Vec<NodeDirectoryEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct NodeDirectoryEntry {
+    id: String,
+    destination: String,
+    default: bool,
+}
+
+async fn discover_default_node(
+    mut endpoint: Endpoint,
+    connect_timeout: Duration,
+) -> io::Result<Endpoint> {
+    if endpoint.packet_destination.is_some() || endpoint.route.is_some() {
+        return Ok(endpoint);
+    }
+    let mut stream = connect(&endpoint, connect_timeout).await?;
+    let head = format!(
+		"GET / HTTP/1.1\r\nHost: {}\r\nAccept: application/vnd.mst5.nodes+json\r\nUser-Agent: OVE-MST5-M5oH/1\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+		endpoint.host_header(),
+	);
+    stream.get_mut().write_all(head.as_bytes()).await?;
+    stream.get_mut().flush().await?;
+    let response = read_response(&mut stream).await?;
+    if response.status != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("M5oH node directory returned HTTP {}", response.status),
+        ));
+    }
+    let directory: NodeDirectory = serde_json::from_slice(&response.body).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "M5oH node directory is invalid")
+    })?;
+    if directory.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported M5oH node directory version",
+        ));
+    }
+    let node = directory
+        .nodes
+        .into_iter()
+        .find(|node| node.default)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "M5oH node directory has no default node",
+            )
+        })?;
+    let destination = node.destination.parse::<SocketAddrV4>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid M5oH node destination for {}", node.id),
+        )
+    })?;
+    if destination.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "M5oH node directory has zero port",
+        ));
+    }
+    endpoint.packet_destination = Some(destination);
+    Ok(endpoint)
 }
 
 async fn bridge(
@@ -328,18 +402,33 @@ async fn request_on(
 ) -> io::Result<HttpResponse> {
     let is_down = channel == "down";
     let method = "GET";
-    let user_agent = endpoint
-        .route
-        .as_deref()
-        .map(|route| format!("OVE-MST5-M5oH/{route}"))
-        .unwrap_or_else(|| "OVE-MST5-M5oH/1".to_string());
-    let target = get_target(endpoint.route.as_deref(), payload);
+    // The packet-routed form is intentionally ordinary `/?r=...`: the node
+    // destination selector is prepended to the Base64URL payload, never
+    // exposed in a URL or header. The route/header form below is legacy-only.
+    let user_agent = if endpoint.packet_destination.is_some() {
+        "OVE-MST5-M5oH/1".to_string()
+    } else {
+        endpoint
+            .route
+            .as_deref()
+            .map(|route| format!("OVE-MST5-M5oH/{route}"))
+            .unwrap_or_else(|| "OVE-MST5-M5oH/1".to_string())
+    };
+    let target = get_target(
+        endpoint.route.as_deref(),
+        endpoint.packet_destination,
+        payload,
+    );
     let mut head = format!(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\nX-MST5-Session: {session_id}\r\nX-MST5-Channel: {channel}\r\nX-MST5-Seq: {sequence}\r\nAccept: application/octet-stream\r\nUser-Agent: {user_agent}\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n",
         endpoint.host_header(),
     );
-    if let Some(route) = &endpoint.route {
-        head.push_str(&format!("X-MST5-Route: {route}\r\n"));
+    // TODO(remove-legacy-m5oh-route): delete this once all deployed clients
+    // use the eight-byte packet-destination selector.
+    if endpoint.packet_destination.is_none() {
+        if let Some(route) = &endpoint.route {
+            head.push_str(&format!("X-MST5-Route: {route}\r\n"));
+        }
     }
     if is_down {
         head.push_str("X-MST5-Max-Response: 8388608\r\n");
@@ -366,14 +455,37 @@ async fn request_on(
 
 /// Bit.Proxy-compatible GET framing.  Keep the route before the payload so a
 /// shared router can choose the upstream without relying on HTTP methods.
-fn get_target(route: Option<&str>, payload: &[u8]) -> String {
+fn get_target(
+    route: Option<&str>,
+    packet_destination: Option<SocketAddrV4>,
+    payload: &[u8],
+) -> String {
+    if let Some(destination) = packet_destination {
+        let mut packet = Vec::with_capacity(8 + payload.len());
+        packet.extend_from_slice(&packet_route_permute(destination));
+        packet.extend_from_slice(payload);
+        return format!("/?r={}", base64url_no_pad(&packet));
+    }
     let encoded = base64url_no_pad(payload);
+    // TODO(remove-legacy-m5oh-route): this visible `m5` selector is retained
+    // only for older endpoints and clients.
     match (route, payload.is_empty()) {
         (Some(route), true) => format!("/?m5={route}"),
         (Some(route), false) => format!("/?m5={route}&r={encoded}"),
         (None, true) => "/".to_string(),
         (None, false) => format!("/?r={encoded}"),
     }
+}
+
+fn packet_route_permute(destination: SocketAddrV4) -> [u8; PACKET_ROUTE_DESTINATION_BYTES] {
+    let mut logical = [0u8; PACKET_ROUTE_DESTINATION_BYTES];
+    logical[..2].copy_from_slice(&destination.port().to_be_bytes());
+    logical[2..6].copy_from_slice(&destination.ip().octets());
+    // wire = logical[1,8,4,6,2,7,5,3]
+    [
+        logical[0], logical[7], logical[3], logical[5], logical[1], logical[6], logical[4],
+        logical[2],
+    ]
 }
 
 fn base64url_no_pad(input: &[u8]) -> String {
@@ -400,18 +512,27 @@ mod tests {
     use super::get_target;
 
     #[test]
-    fn uses_bit_proxy_get_framing_with_a_route_selector() {
-        assert_eq!(get_target(Some("main"), &[]), "/?m5=main");
+    fn legacy_route_selector_remains_compatible() {
+        assert_eq!(get_target(Some("main"), None, &[]), "/?m5=main");
         assert_eq!(
-            get_target(Some("file-main"), &[0, 1, 2]),
+            get_target(Some("file-main"), None, &[0, 1, 2]),
             "/?m5=file-main&r=AAEC"
         );
-        assert_eq!(get_target(None, &[0, 1]), "/?r=AAE");
+        assert_eq!(get_target(None, None, &[0, 1]), "/?r=AAE");
+    }
+
+    #[test]
+    fn packet_destination_is_inside_the_get_payload_in_permuted_order() {
+        let destination = "10.100.2.228:8080".parse().unwrap();
+        let target = get_target(None, Some(destination), &[0, 1]);
+        assert_eq!(target, "/?r=HwBk5JAAAgoAAQ");
+        assert!(!target.contains("m5="));
     }
 
     #[test]
     fn routed_get_target_fits_the_cdn_limit() {
-        let target = get_target(Some("file-main"), &vec![0x5a; super::UPLOAD_CHUNK]);
+        let destination = "10.100.2.228:8081".parse().unwrap();
+        let target = get_target(None, Some(destination), &vec![0x5a; super::UPLOAD_CHUNK]);
         assert_eq!(target.len(), 31_407);
     }
 }

@@ -536,13 +536,13 @@ fn validate_session_values(values: &BTreeMap<String, String>) -> io::Result<()> 
 mod tests {
     use super::*;
 
-    const CHAIN: &str = "http://cdn.example/main|mst5://central.example:8067/main";
+    const CHAIN: &str = "http://cdn.example/10.100.2.228:8080|mst5://central.example:8067/main";
 
     #[test]
     fn auto_always_prefers_mst5() {
         assert_eq!(
             select_endpoint(CHAIN, TransportMode::Auto).unwrap(),
-            "mst5://central.example:8067/main|http://cdn.example/main"
+            "mst5://central.example:8067/main|http://cdn.example/10.100.2.228:8080"
         );
     }
 
@@ -550,7 +550,7 @@ mod tests {
     fn forced_transport_does_not_fall_back() {
         assert_eq!(
             select_endpoint(CHAIN, TransportMode::M5oh).unwrap(),
-            "http://cdn.example/main"
+            "http://cdn.example/10.100.2.228:8080"
         );
         assert!(select_endpoint("mst5://central.example:8067/main", TransportMode::M5oh).is_err());
     }
