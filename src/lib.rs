@@ -226,6 +226,7 @@ pub mod op {
     pub const STICKER_PRICE: u16 = 85;
     pub const AVATAR_PREPARE: u16 = 86;
     pub const AVATAR_COMMIT: u16 = 87;
+    pub const AVATAR_DELETE: u16 = 88;
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -397,6 +397,7 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("POST", "/messages/cancel") => op::MESSAGE_CANCEL,
         ("POST", "/avatars/prepare") => op::AVATAR_PREPARE,
         ("POST", "/avatars/commit") => op::AVATAR_COMMIT,
+        ("POST", "/avatars/delete") => op::AVATAR_DELETE,
         ("POST", "/profiles/description") => op::SET_PROFILE_DESCRIPTION,
         _ => {
             return Err(invalid_input(format!(
