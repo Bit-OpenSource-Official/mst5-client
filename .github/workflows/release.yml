@@ -44,8 +44,33 @@ jobs:
           version="${GITHUB_REF_NAME#release/}"
           crate="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
           ffi="$(sed -n 's/^version = "\([^"]*\)"/\1/p' ffi/Cargo.toml | head -n1)"
-          [[ "$version" == "$crate" && "$version" == "$ffi" ]]
+          wasm="$(sed -n 's/^version = "\([^"]*\)"/\1/p' wasm/Cargo.toml | head -n1)"
+          [[ "$version" == "$crate" && "$version" == "$ffi" && "$version" == "$wasm" ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  # This is intentionally an independent target: browser packaging must not
+  # wait for the Apple or Android matrices.  The resulting archive contains
+  # ESM glue and the wasm binary, ready to be served by a web client.
+  wasm:
+    needs: [test, version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Build browser package
+        run: |
+          rm -rf dist/wasm
+          wasm-pack build wasm --release --target web --out-dir ../dist/wasm
+          version="${{ needs.version.outputs.value }}"
+          printf '{"abi":1,"version":"%s","target":"wasm32-unknown-unknown","format":"web-esm"}\n' "$version" > dist/wasm/manifest.json
+          tar -C dist -czf "dist/mst5-client-${version}-wasm.tar.gz" wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-wasm
+          path: dist/*.tar.gz
   linux:
     needs: [test, version]
     strategy:
@@ -252,7 +277,7 @@ jobs:
             dist/*.zip
 
   publish:
-    needs: [version, linux, windows, apple, apple-bundles, android]
+    needs: [version, linux, windows, apple, apple-bundles, android, wasm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
