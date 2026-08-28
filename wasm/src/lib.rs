@@ -64,11 +64,17 @@ const BROWSER_MEDIA_CHUNK: usize = 16 * 1024;
 const MST5_KIND_AUTH: u8 = 1;
 const MST5_KIND_RESULT: u8 = 4;
 const MST5_KIND_ACK: u8 = 6;
+const MST5_KIND_ERROR: u8 = 7;
 const MST5_KIND_HELLO: u8 = 11;
 const MST5_KIND_STREAM_OPEN: u8 = 14;
 const MST5_KIND_STREAM_DATA: u8 = 15;
 const MST5_KIND_STREAM_END: u8 = 16;
 const MEDIA_OP_UPLOAD: u16 = 1;
+const MEDIA_OP_DOWNLOAD: u16 = 2;
+// A browser has to materialize a Blob before it can display or save it. Keep
+// that explicit bound below the usual tab memory budget instead of accepting a
+// server-provided size that could make a page allocate unbounded memory.
+const MAX_BROWSER_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 const EMBEDDED_ACCOUNT_PUBLIC_KEY: &str = env!("CRYPT_SERVER_PUBLIC_KEY_B64");
 
 /// Encodes the opaque eight byte node selector exactly as the router expects.
@@ -166,7 +172,7 @@ mod tests {
         let command = frame_encode(2, 40, 7, b"payload").expect("command frame");
         assert!(command[12..28].iter().any(|byte| *byte != 0));
 
-        let query = frame_encode(3, 49, 8, b"").expect("query frame");
+        let query = frame_encode(3, 51, 8, b"").expect("query frame");
         assert!(query[12..28].iter().all(|byte| *byte == 0));
     }
 
@@ -184,6 +190,29 @@ mod tests {
         assert!(id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+
+    #[test]
+    fn messenger_operation_codes_match_the_server_contract() {
+        // Keep the browser ABI in sync with micromsg/src/mst5.rs. These used
+        // to be shifted by two after the server reserved operations 48 and 49,
+        // which made a successful browser login fail immediately on /chats.
+        for ((method, path), expected) in [
+            (("GET", "/nodes/status"), 50),
+            (("GET", "/chats"), 51),
+            (("POST", "/chats/delete"), 52),
+            (("GET", "/history"), 55),
+            (("GET", "/updates"), 56),
+            (("GET", "/oauth/device/request"), 60),
+            (("GET", "/file/ticket"), 65),
+            (("POST", "/forward"), 69),
+            (("POST", "/media/quote"), 70),
+        ] {
+            assert_eq!(
+                operation(method, path).expect("registered operation"),
+                expected
+            );
+        }
     }
 }
 
@@ -342,6 +371,44 @@ impl Mst5Web {
         .await?;
         media_authenticate(&mut session, ticket).await?;
         session.upload_media(&file_id, &bytes).await
+    }
+
+    /// Downloads one media object over a separate encrypted MST5 media stream.
+    /// The ticket is obtained by the authenticated messenger session via
+    /// `/file/ticket`; it authorizes exactly one file and expires quickly.
+    #[wasm_bindgen]
+    pub async fn download_media(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        server_public_key_b64: String,
+        ticket: String,
+        file_id: String,
+        expected_size: u64,
+    ) -> Result<Uint8Array, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 {
+            return Err(JsValue::from_str(
+                "media ticket, file id and expected size are required",
+            ));
+        }
+        let expected_size = usize::try_from(expected_size)
+            .map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        if expected_size > MAX_BROWSER_DOWNLOAD_BYTES {
+            return Err(JsValue::from_str(
+                "media file exceeds the browser download memory limit",
+            ));
+        }
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(
+            m5ohs_endpoint,
+            destination,
+            server_public_key_b64,
+            REQUIRED_MEDIA_FEATURES,
+        )
+        .await?;
+        media_authenticate(&mut session, ticket).await?;
+        let bytes = session.download_media(&file_id, expected_size).await?;
+        Ok(Uint8Array::from(bytes.as_slice()))
     }
 
     #[wasm_bindgen]
@@ -522,6 +589,64 @@ impl BrowserSession {
             return Err(frame_error("media upload failed", &result));
         }
         Ok(())
+    }
+
+    async fn download_media(
+        &mut self,
+        file_id: &str,
+        expected_size: usize,
+    ) -> Result<Vec<u8>, JsValue> {
+        let id = self.take_request_id()?;
+        let payload = serde_cbor::to_vec(&serde_json::json!({"file_id": file_id}))
+            .map_err(|_| JsValue::from_str("cannot encode media download open"))?;
+        self.write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_DOWNLOAD, id, &payload)
+            .await?;
+        let accepted = self.read_matching_frame(id).await?;
+        if accepted.kind != MST5_KIND_ACK || accepted.code != 100 {
+            return Err(frame_error("media download was rejected", &accepted));
+        }
+        let metadata: JsonValue = serde_cbor::from_slice(&accepted.payload)
+            .map_err(|_| JsValue::from_str("invalid media download acknowledgement"))?;
+        let announced = metadata
+            .get("size")
+            .and_then(JsonValue::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| JsValue::from_str("media node omitted a valid file size"))?;
+        if announced != expected_size {
+            return Err(JsValue::from_str("media file size changed before download"));
+        }
+
+        let mut data = Vec::with_capacity(announced);
+        let mut digest = Sha256::new();
+        loop {
+            let frame = self.read_matching_frame(id).await?;
+            match frame.kind {
+                MST5_KIND_STREAM_DATA => {
+                    if frame.payload.is_empty()
+                        || frame.payload.len() > BROWSER_MEDIA_CHUNK
+                        || data.len().saturating_add(frame.payload.len()) > announced
+                    {
+                        return Err(JsValue::from_str("invalid MST5 media download chunk"));
+                    }
+                    digest.update(&frame.payload);
+                    data.extend_from_slice(&frame.payload);
+                }
+                MST5_KIND_STREAM_END => {
+                    let end: JsonValue = serde_cbor::from_slice(&frame.payload)
+                        .map_err(|_| JsValue::from_str("invalid MST5 media download end"))?;
+                    let checksum = hex_bytes(&digest.finalize());
+                    if data.len() != announced
+                        || end.get("size").and_then(JsonValue::as_u64) != Some(data.len() as u64)
+                        || end.get("sha256").and_then(JsonValue::as_str) != Some(checksum.as_str())
+                    {
+                        return Err(JsValue::from_str("MST5 media download checksum mismatch"));
+                    }
+                    return Ok(data);
+                }
+                MST5_KIND_ERROR => return Err(frame_error("media download failed", &frame)),
+                _ => return Err(JsValue::from_str("unexpected MST5 media download frame")),
+            }
+        }
     }
 
     fn take_request_id(&mut self) -> Result<u64, JsValue> {
@@ -1040,18 +1165,18 @@ fn operation(method: &str, path: &str) -> Result<u16, JsValue> {
         ("POST", "/read") => 45,
         ("POST", "/delete") => 46,
         ("POST", "/favorite") => 47,
-        ("GET", "/nodes/status") => 48,
-        ("GET", "/chats") => 49,
-        ("POST", "/chats/delete") => 50,
-        ("POST", "/users/ban") => 51,
-        ("POST", "/users/unban") => 52,
-        ("GET", "/history") => 53,
-        ("GET", "/updates") => 54,
-        ("GET", "/oauth/device/request") => 55,
-        ("POST", "/oauth/device/decision") => 56,
-        ("GET", "/file/ticket") => 57,
-        ("POST", "/forward") => 58,
-        ("POST", "/media/quote") => 59,
+        ("GET", "/nodes/status") => 50,
+        ("GET", "/chats") => 51,
+        ("POST", "/chats/delete") => 52,
+        ("POST", "/users/ban") => 53,
+        ("POST", "/users/unban") => 54,
+        ("GET", "/history") => 55,
+        ("GET", "/updates") => 56,
+        ("GET", "/oauth/device/request") => 60,
+        ("POST", "/oauth/device/decision") => 61,
+        ("GET", "/file/ticket") => 65,
+        ("POST", "/forward") => 69,
+        ("POST", "/media/quote") => 70,
         ("POST", "/messages/prepare") => 71,
         ("POST", "/messages/commit") => 72,
         ("POST", "/messages/cancel") => 73,
