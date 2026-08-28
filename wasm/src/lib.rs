@@ -72,6 +72,7 @@ const MST5_KIND_HELLO: u8 = 11;
 const MST5_KIND_STREAM_OPEN: u8 = 14;
 const MST5_KIND_STREAM_DATA: u8 = 15;
 const MST5_KIND_STREAM_END: u8 = 16;
+const MST5_KIND_STREAM_ABORT: u8 = 17;
 const MEDIA_OP_UPLOAD: u16 = 1;
 const MEDIA_OP_DOWNLOAD: u16 = 2;
 // A browser has to materialize a Blob before it can display or save it. Keep
@@ -221,7 +222,8 @@ mod tests {
     #[test]
     fn deflate_result_frames_are_decoded_with_a_bound() {
         let plain = b"chat list ".repeat(1024);
-        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut encoder, &plain).expect("compress frame payload");
         let compressed = encoder.finish().expect("finish compressed frame payload");
         let mut frame = Vec::with_capacity(40 + compressed.len());
@@ -232,7 +234,12 @@ mod tests {
         frame.extend_from_slice(&0u64.to_be_bytes());
         frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
         frame.extend_from_slice(&compressed);
-        assert_eq!(frame_decode(&frame).expect("decode compressed frame").payload, plain);
+        assert_eq!(
+            frame_decode(&frame)
+                .expect("decode compressed frame")
+                .payload,
+            plain
+        );
     }
 }
 
@@ -252,6 +259,23 @@ struct BrowserSession {
     open: CipherState,
     handshake_hash: [u8; 32],
     next_request: u64,
+}
+
+struct BrowserMediaUpload {
+    session: BrowserSession,
+    id: u64,
+    expected_size: usize,
+    sent: usize,
+    chunk_size: usize,
+    digest: Sha256,
+}
+
+/// A single ticket-authorized, encrypted media upload. JavaScript feeds it
+/// short `File.stream()` chunks, so the full source file never has to be
+/// duplicated in a WebAssembly `Uint8Array`.
+#[wasm_bindgen]
+pub struct Mst5MediaUpload {
+    inner: RefCell<Option<BrowserMediaUpload>>,
 }
 
 /// Stateful, browser-safe MST5 client. All secure-transport and frame logic
@@ -393,6 +417,40 @@ impl Mst5Web {
         session.upload_media(&file_id, &bytes).await
     }
 
+    /// Opens a streaming media upload. Prefer this method for browser `File`
+    /// objects; `upload_media` remains for backwards-compatible callers.
+    #[wasm_bindgen]
+    pub async fn begin_media_upload(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        server_public_key_b64: String,
+        ticket: String,
+        file_id: String,
+        expected_size: u64,
+    ) -> Result<Mst5MediaUpload, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 {
+            return Err(JsValue::from_str(
+                "media ticket, file id and expected size are required",
+            ));
+        }
+        let expected_size = usize::try_from(expected_size)
+            .map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(
+            m5ohs_endpoint,
+            destination,
+            server_public_key_b64,
+            REQUIRED_MEDIA_FEATURES,
+        )
+        .await?;
+        media_authenticate(&mut session, ticket).await?;
+        let upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
+        Ok(Mst5MediaUpload {
+            inner: RefCell::new(Some(upload)),
+        })
+    }
+
     /// Downloads one media object over a separate encrypted MST5 media stream.
     /// The ticket is obtained by the authenticated messenger session via
     /// `/file/ticket`; it authorizes exactly one file and expires quickly.
@@ -434,6 +492,49 @@ impl Mst5Web {
     #[wasm_bindgen]
     pub async fn close(&self) -> Result<(), JsValue> {
         *self.inner.borrow_mut() = None;
+        Ok(())
+    }
+}
+
+#[wasm_bindgen]
+impl Mst5MediaUpload {
+    /// Sends one browser stream chunk. The bridge further splits it to stay
+    /// below the M5oH CDN GET envelope limit.
+    #[wasm_bindgen]
+    pub async fn write(&self, data: Uint8Array) -> Result<(), JsValue> {
+        if data.length() == 0 {
+            return Ok(());
+        }
+        let mut bytes = vec![0; data.length() as usize];
+        data.copy_to(&mut bytes);
+        let mut borrow = self.inner.borrow_mut();
+        let upload = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("media upload is already closed"))?;
+        upload.write(&bytes).await
+    }
+
+    /// Verifies the browser byte count, sends STREAM_END with SHA-256 and
+    /// waits for the file node's final result.
+    #[wasm_bindgen]
+    pub async fn finish(&self) -> Result<(), JsValue> {
+        let mut borrow = self.inner.borrow_mut();
+        let upload = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("media upload is already closed"))?;
+        upload.finish().await?;
+        *borrow = None;
+        Ok(())
+    }
+
+    /// Stops an unfinished stream before the messenger cancels its upload
+    /// operation and releases its reservation.
+    #[wasm_bindgen]
+    pub async fn abort(&self) -> Result<(), JsValue> {
+        let upload = self.inner.borrow_mut().take();
+        if let Some(mut upload) = upload {
+            upload.abort().await?;
+        }
         Ok(())
     }
 }
@@ -524,6 +625,81 @@ async fn authenticate_session(
         )));
     }
     Ok(())
+}
+
+impl BrowserMediaUpload {
+    async fn open(
+        mut session: BrowserSession,
+        file_id: String,
+        expected_size: usize,
+    ) -> Result<Self, JsValue> {
+        let id = session.take_request_id()?;
+        let payload =
+            serde_cbor::to_vec(&serde_json::json!({"file_id": file_id, "size": expected_size}))
+                .map_err(|_| JsValue::from_str("cannot encode media stream open"))?;
+        session
+            .write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_UPLOAD, id, &payload)
+            .await?;
+        let accepted = session.read_matching_frame(id).await?;
+        if accepted.kind != MST5_KIND_ACK || accepted.code != 100 {
+            return Err(frame_error("media upload was rejected", &accepted));
+        }
+        let details: JsonValue = serde_cbor::from_slice(&accepted.payload)
+            .map_err(|_| JsValue::from_str("invalid media upload acknowledgement"))?;
+        let server_chunk = details
+            .get("chunk_size")
+            .and_then(JsonValue::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| *size > 0)
+            .ok_or_else(|| JsValue::from_str("media node did not provide a chunk size"))?;
+        Ok(Self {
+            session,
+            id,
+            expected_size,
+            sent: 0,
+            chunk_size: BROWSER_MEDIA_CHUNK.min(server_chunk),
+            digest: Sha256::new(),
+        })
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<(), JsValue> {
+        if self.sent.saturating_add(data.len()) > self.expected_size {
+            return Err(JsValue::from_str("media source exceeds its declared size"));
+        }
+        for chunk in data.chunks(self.chunk_size) {
+            self.digest.update(chunk);
+            self.session
+                .write_frame(MST5_KIND_STREAM_DATA, 0, self.id, chunk)
+                .await?;
+            self.sent += chunk.len();
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<(), JsValue> {
+        if self.sent != self.expected_size {
+            return Err(JsValue::from_str(
+                "media source ended before its declared size",
+            ));
+        }
+        let checksum = hex_bytes(&self.digest.clone().finalize());
+        let end = serde_cbor::to_vec(&serde_json::json!({"size": self.sent, "sha256": checksum}))
+            .map_err(|_| JsValue::from_str("cannot encode media stream end"))?;
+        self.session
+            .write_frame(MST5_KIND_STREAM_END, 200, self.id, &end)
+            .await?;
+        let result = self.session.read_matching_frame(self.id).await?;
+        if result.kind != MST5_KIND_RESULT || !(200..300).contains(&result.code) {
+            return Err(frame_error("media upload failed", &result));
+        }
+        Ok(())
+    }
+
+    async fn abort(&mut self) -> Result<(), JsValue> {
+        self.session
+            .write_frame(MST5_KIND_STREAM_ABORT, 499, self.id, &[])
+            .await
+    }
 }
 
 impl BrowserSession {
@@ -1006,7 +1182,9 @@ fn frame_decode(input: &[u8]) -> Result<Frame, JsValue> {
             .read_to_end(&mut output)
             .map_err(|_| JsValue::from_str("invalid MST5 deflate payload"))?;
         if output.len() > MAX_RECORD_BYTES {
-            return Err(JsValue::from_str("MST5 deflate payload exceeds the frame limit"));
+            return Err(JsValue::from_str(
+                "MST5 deflate payload exceeds the frame limit",
+            ));
         }
         output
     } else {
