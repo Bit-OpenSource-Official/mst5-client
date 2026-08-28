@@ -28,6 +28,7 @@ const HEADER_SESSION: &str = "X-MST5-Session";
 const HEADER_CHANNEL: &str = "X-MST5-Channel";
 const HEADER_SEQUENCE: &str = "X-MST5-Seq";
 const HEADER_EOF: &str = "X-MST5-EOF";
+const HEADER_STATUS: &str = "X-MST5-Status";
 const MAX_GET_BYTES: usize = 23 * 1024 - 8;
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
 const SERVER_MAGIC: &[u8; 4] = b"RSP5";
@@ -1143,6 +1144,14 @@ impl M5ohFetch {
                 "M5oH HTTP {}",
                 response.status()
             )));
+        }
+        // The GET-only router uses a tiny `OK` body to keep an empty
+        // long-poll response cacheable/replayable.  The accompanying status
+        // header makes it control data, not bytes from the encrypted TCP
+        // stream.  Treating that body as RSP5 caused an intermittent
+        // "invalid MST5 server hello" on a freshly opened browser tunnel.
+        if response.headers().get(HEADER_STATUS)?.as_deref() == Some("OK") {
+            return Ok(Uint8Array::new_with_length(0));
         }
         let body = JsFuture::from(response.array_buffer()?).await?;
         Ok(Uint8Array::new(&body))
