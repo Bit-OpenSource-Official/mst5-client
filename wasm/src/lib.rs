@@ -64,6 +64,7 @@ const REQUIRED_MEDIA_FEATURES: u64 = FEATURE_STRUCTURED_ERRORS | FEATURE_MEDIA_S
 // relying on the media node's much larger 256 KiB native-TCP chunk size.
 const BROWSER_MEDIA_CHUNK: usize = 16 * 1024;
 const MST5_KIND_AUTH: u8 = 1;
+const MST5_KIND_COMMAND: u8 = 2;
 const MST5_FLAG_DEFLATE: u8 = 1;
 const MST5_KIND_RESULT: u8 = 4;
 const MST5_KIND_ACK: u8 = 6;
@@ -185,6 +186,16 @@ mod tests {
         assert!(successful_response(11, 11, 200));
         assert!(!successful_response(11, 4, 200));
         assert!(successful_response(2, 4, 201));
+    }
+
+    #[test]
+    fn email_auth_extracts_the_session_token_before_js_conversion() {
+        assert_eq!(
+            auth_session_token(&serde_json::json!({ "token": "session-value" })),
+            Some("session-value".to_string())
+        );
+        assert_eq!(auth_session_token(&serde_json::json!({ "token": "" })), None);
+        assert_eq!(auth_session_token(&serde_json::json!({ "ok": true })), None);
     }
 
     #[test]
@@ -347,6 +358,65 @@ impl Mst5Web {
         Ok(())
     }
 
+    /// Requests a one-time e-mail code over the current anonymous MST5
+    /// session.  Keeping this operation in the SDK means a web UI never has
+    /// to encode an auth opcode or interpret a transport response itself.
+    #[wasm_bindgen]
+    pub async fn start_email_auth(&self, email: String) -> Result<(), JsValue> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(JsValue::from_str("e-mail is required"));
+        }
+        let mut borrow = self.inner.borrow_mut();
+        let session = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("MST5 is not connected"))?;
+        let result = session
+            .request(
+                MST5_KIND_COMMAND,
+                3,
+                serde_json::json!({ "email": email }),
+            )
+            .await?;
+        if result.0 {
+            Ok(())
+        } else {
+            Err(JsValue::from_str(&result.1))
+        }
+    }
+
+    /// Verifies an e-mail code and returns only the server-issued session
+    /// token.  Parsing happens in Rust so differing JS object/map conversion
+    /// rules cannot turn a valid auth response into a missing token.
+    #[wasm_bindgen]
+    pub async fn verify_email_auth(
+        &self,
+        email: String,
+        code: String,
+        cloud_password: String,
+    ) -> Result<String, JsValue> {
+        let mut borrow = self.inner.borrow_mut();
+        let session = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("MST5 is not connected"))?;
+        let result = session
+            .request(
+                MST5_KIND_COMMAND,
+                4,
+                serde_json::json!({
+                    "email": email.trim(),
+                    "code": code.trim(),
+                    "cloud_password": cloud_password,
+                }),
+            )
+            .await?;
+        if !result.0 {
+            return Err(JsValue::from_str(&result.1));
+        }
+        auth_session_token(&result.2)
+            .ok_or_else(|| JsValue::from_str("MST5 auth response did not contain a session"))
+    }
+
     #[wasm_bindgen]
     pub async fn command(&self, command: JsValue) -> Result<JsValue, JsValue> {
         let input: JsonValue = serde_wasm_bindgen::from_value(command)
@@ -394,7 +464,8 @@ impl Mst5Web {
         }
         serde_wasm_bindgen::to_value(&result.2)
             .map_err(|_| JsValue::from_str("cannot return MST5 response"))
-    }
+}
+
 
     /// Uploads a media object over a separate encrypted MST5 media stream.
     /// `media_endpoint` is the server-provided `raw|m5oh` endpoint; the raw
@@ -500,6 +571,14 @@ impl Mst5Web {
         *self.inner.borrow_mut() = None;
         Ok(())
     }
+}
+
+fn auth_session_token(value: &JsonValue) -> Option<String> {
+    value
+        .get("token")
+        .and_then(JsonValue::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(str::to_owned)
 }
 
 #[wasm_bindgen]
