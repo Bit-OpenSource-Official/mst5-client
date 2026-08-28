@@ -99,6 +99,18 @@ fn java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, Strin
         .map_err(|error| format!("invalid Java string: {error}"))
 }
 
+/// Release artifacts carry the account server pin compiled into
+/// `mst5-client`.  JNI keeps accepting the legacy Java argument so debug
+/// builds can still target a development server, but a configured compiled
+/// pin always wins.  This applies equally to the messenger, media and voice
+/// paths and prevents the Java layer from accidentally using a different
+/// server identity.
+fn configured_server_public_key(supplied: String) -> String {
+    compiled_server_public_key_b64()
+        .map(str::to_owned)
+        .unwrap_or(supplied)
+}
+
 fn java_bytes(env: &mut JNIEnv<'_>, value: JByteArray<'_>) -> Result<Vec<u8>, String> {
     env.convert_byte_array(&value)
         .map_err(|error| format!("invalid Java byte array: {error}"))
@@ -263,10 +275,10 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeOpen(
         let supplied_public_key = java_string(&mut env, public_key)?;
         let device_model = java_string(&mut env, device_model)?;
         let transport_mode = java_string(&mut env, transport_mode)?;
-        let public_key = compiled_server_public_key_b64().unwrap_or(&supplied_public_key);
+        let public_key = configured_server_public_key(supplied_public_key);
         let messenger = MessengerCore::new(MessengerConfig::new(
             endpoint,
-            public_key,
+            &public_key,
             device_model,
             TransportMode::parse(&transport_mode),
         ))
@@ -781,7 +793,7 @@ fn transfer_strings(
 ) -> Result<(String, String, String, String), String> {
     Ok((
         java_string(env, endpoint)?,
-        java_string(env, public_key)?,
+        configured_server_public_key(java_string(env, public_key)?),
         java_string(env, ticket)?,
         java_string(env, file_id)?,
     ))
@@ -932,13 +944,13 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadBatch(
 ) -> jboolean {
     let result = (|| -> Result<(), String> {
         let endpoints = java_string_array(&mut env, &endpoints)?;
-        let public_keys = java_string_array(&mut env, &public_keys)?;
+        let supplied_public_keys = java_string_array(&mut env, &public_keys)?;
         let tickets = java_string_array(&mut env, &tickets)?;
         let file_ids = java_string_array(&mut env, &file_ids)?;
         let count = endpoints.len();
         if count == 0
             || count > 64
-            || public_keys.len() != count
+            || supplied_public_keys.len() != count
             || tickets.len() != count
             || file_ids.len() != count
             || env
@@ -952,6 +964,11 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadBatch(
         {
             return Err("media batch arrays must have the same 1..64 length".to_string());
         }
+        let public_keys = if let Ok(key) = compiled_server_public_key_b64() {
+            vec![key.to_owned(); count]
+        } else {
+            supplied_public_keys
+        };
         let mut sizes_raw = vec![0_i64; count];
         let mut fds_raw = vec![0_i32; count];
         env.get_long_array_region(&sizes, 0, &mut sizes_raw)
@@ -1272,7 +1289,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceOpen(
 ) -> jlong {
     let result = (|| -> Result<i64, String> {
         let endpoint = java_string(&mut env, endpoint)?;
-        let public_key = java_string(&mut env, public_key)?;
+        let public_key = configured_server_public_key(java_string(&mut env, public_key)?);
         let ticket = java_string(&mut env, ticket)?;
         let stream = runtime()?
             .block_on(Client::connect_voice(&endpoint, &public_key, &ticket))
