@@ -15,6 +15,7 @@ use chacha20poly1305::{
 use flate2::read::DeflateDecoder;
 use hkdf::Hkdf;
 use js_sys::Uint8Array;
+use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -462,7 +463,12 @@ impl Mst5Web {
         if !result.0 {
             return Err(JsValue::from_str(&result.1));
         }
-        serde_wasm_bindgen::to_value(&result.2)
+        // `serde_json::Value::Object` serializes as an ES Map by default.
+        // A web client consumes RPC replies as JSON, so preserve the normal
+        // browser object shape all the way through nested chats, users,
+        // wallets and media instead of forcing every UI to understand Map.
+        result.2
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
             .map_err(|_| JsValue::from_str("cannot return MST5 response"))
 }
 
