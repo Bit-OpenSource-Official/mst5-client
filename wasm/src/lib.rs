@@ -14,14 +14,14 @@ use chacha20poly1305::{
 };
 use flate2::read::DeflateDecoder;
 use hkdf::Hkdf;
-use js_sys::Uint8Array;
+use js_sys::{Function, Promise, Uint8Array};
 use mst5_e2e_core as e2e;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::io::Read;
-use wasm_bindgen::{prelude::*, JsCast};
+use wasm_bindgen::{closure::Closure, prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestInit, Response};
 use x25519_dalek::{PublicKey, ReusableSecret};
@@ -65,6 +65,11 @@ const REQUIRED_MEDIA_FEATURES: u64 = FEATURE_STRUCTURED_ERRORS | FEATURE_MEDIA_S
 // the frame header, encrypted record header/tag and padding instead of
 // relying on the media node's much larger 256 KiB native-TCP chunk size.
 const BROWSER_MEDIA_CHUNK: usize = 16 * 1024;
+// M5oH downstream is a GET-only mailbox.  An empty `OK` response means the
+// router has no bytes yet; it is not an invitation to spin another GET in the
+// same event-loop turn.  Keep this policy in the SDK, rather than every UI.
+const M5OH_EMPTY_POLL_INITIAL_MS: i32 = 125;
+const M5OH_EMPTY_POLL_MAX_MS: i32 = 2_000;
 const MST5_KIND_AUTH: u8 = 1;
 const MST5_KIND_COMMAND: u8 = 2;
 const MST5_FLAG_DEFLATE: u8 = 1;
@@ -982,6 +987,29 @@ fn browser_tunnel_id() -> Result<String, JsValue> {
     Ok(hex_bytes(&random))
 }
 
+/// Yield to the browser between empty M5oH mailbox reads.  The timer stays in
+/// Rust/WASM so application code cannot accidentally create an unbounded GET
+/// loop while a router is still establishing an upstream connection.
+async fn browser_sleep(delay_ms: i32) -> Result<(), JsValue> {
+    let window = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("browser window is unavailable"))?;
+    let promise = Promise::new(&mut move |resolve, reject| {
+        let resolve = resolve.clone();
+        let reject = reject.clone();
+        let callback = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        let callback: &Function = callback.unchecked_ref();
+        if let Err(error) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback,
+            delay_ms.max(0),
+        ) {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise).await.map(|_| ())
+}
+
 async fn media_authenticate(session: &mut BrowserSession, ticket: String) -> Result<(), JsValue> {
     let result = session
         .request(
@@ -1398,6 +1426,7 @@ impl BrowserSession {
     }
 
     async fn read_exact(&mut self, length: usize) -> Result<Vec<u8>, JsValue> {
+        let mut empty_delay_ms = M5OH_EMPTY_POLL_INITIAL_MS;
         while self.received.len() < length {
             let bytes = self
                 .transport
@@ -1407,6 +1436,14 @@ impl BrowserSession {
                 .downstream_seq
                 .checked_add(1)
                 .ok_or_else(|| JsValue::from_str("M5oH download sequence exhausted"))?;
+            if bytes.is_empty() {
+                browser_sleep(empty_delay_ms).await?;
+                empty_delay_ms = empty_delay_ms
+                    .saturating_mul(2)
+                    .min(M5OH_EMPTY_POLL_MAX_MS);
+                continue;
+            }
+            empty_delay_ms = M5OH_EMPTY_POLL_INITIAL_MS;
             self.received.extend_from_slice(&bytes);
         }
         Ok(self.received.drain(..length).collect())
@@ -1438,9 +1475,18 @@ async fn handshake(
         .await?;
     let mut received = Vec::new();
     let mut down = 0;
+    let mut empty_delay_ms = M5OH_EMPTY_POLL_INITIAL_MS;
     while received.len() < 54 {
         let body = transport.downstream_bytes(&tunnel_id, down).await?;
         down += 1;
+        if body.is_empty() {
+            browser_sleep(empty_delay_ms).await?;
+            empty_delay_ms = empty_delay_ms
+                .saturating_mul(2)
+                .min(M5OH_EMPTY_POLL_MAX_MS);
+            continue;
+        }
+        empty_delay_ms = M5OH_EMPTY_POLL_INITIAL_MS;
         received.extend_from_slice(&body);
     }
     if &received[..4] != SERVER_MAGIC || u16::from_be_bytes([received[4], received[5]]) != 48 {
