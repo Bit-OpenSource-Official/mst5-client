@@ -1976,14 +1976,11 @@ impl M5ohFetch {
                 packet.extend_from_slice(&record);
                 format!("{}/?r={}", self.endpoint, URL_SAFE_NO_PAD.encode(packet))
             }
-            // The initial upstream GET creates the router session and carries
-            // its opaque destination prefix.  A downstream poll belongs to
-            // that session already, so its payload must be empty.  Repeating
-            // the prefix here makes older deployed routers reject it as
-            // downstream data, leaving browser login stuck at “Sending…”.
-            // `r` remains present (the canonical GET-only M5oH shape), but
-            // contains no bytes and exposes no destination.
-            None => format!("{}/?r=", self.endpoint),
+            // M5oH carries its opaque route selector at the start of every
+            // GET payload. This is the same packet format as the native
+            // clients and lets requests be routed independently of HTTP
+            // headers while keeping the destination unreadable in the URL.
+            None => format!("{}/?r={}", self.endpoint, self.route),
         };
         let headers = Headers::new()?;
         headers.set(HEADER_SESSION, &session)?;
