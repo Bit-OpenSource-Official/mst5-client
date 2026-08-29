@@ -15,7 +15,8 @@ use chacha20poly1305::{
 use flate2::read::DeflateDecoder;
 use hkdf::Hkdf;
 use js_sys::Uint8Array;
-use serde::Serialize;
+use mst5_e2e_core as e2e;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -304,6 +305,125 @@ pub struct Mst5MediaUpload {
     inner: RefCell<Option<BrowserMediaUpload>>,
 }
 
+struct BrowserE2eMediaUpload {
+    upload: BrowserMediaUpload,
+    encryptor: e2e::MediaEncryptor,
+    /// Browser `File.stream()` chunks are not guaranteed to be aligned to the
+    /// authenticated 64 KiB E2E-media chunks.  Retain at most one chunk here
+    /// and write ciphertext straight to the MST5 stream.
+    pending: Vec<u8>,
+}
+
+/// Streaming E2E media writer. Plaintext only exists transiently in the
+/// browser-provided chunk and the small alignment buffer; the media node sees
+/// the V2 encrypted-media container exclusively.
+#[wasm_bindgen]
+pub struct Mst5E2eMediaUpload {
+    inner: RefCell<Option<BrowserE2eMediaUpload>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct E2eEnvelopeJson {
+    version: u8,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct E2eBackupJson {
+    version: u8,
+    salt: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+/// Opaque application-level E2E identity. The private key is used only in
+/// Rust/WASM for envelope and media operations; export is solely for placing
+/// an encrypted copy in the browser's non-extractable IndexedDB key store.
+#[wasm_bindgen]
+pub struct Mst5E2eIdentity {
+    inner: RefCell<Option<e2e::Identity>>,
+}
+
+#[wasm_bindgen]
+impl Mst5E2eIdentity {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<Self, JsValue> {
+        Ok(Self { inner: RefCell::new(Some(e2e::Identity::generate().map_err(e2e_error)?)) })
+    }
+
+    #[wasm_bindgen(js_name = importPrivate)]
+    pub fn import_private(private: Uint8Array) -> Result<Self, JsValue> {
+        if private.length() != 32 { return Err(JsValue::from_str("E2E private key must be 32 bytes")); }
+        let mut bytes = [0u8; 32]; private.copy_to(&mut bytes);
+        let identity = e2e::Identity::from_private(bytes);
+        bytes.zeroize();
+        Ok(Self { inner: RefCell::new(Some(identity)) })
+    }
+
+    #[wasm_bindgen(js_name = restoreBackup)]
+    pub fn restore_backup(backup: JsValue, password: String) -> Result<Self, JsValue> {
+        let backup = parse_backup(backup)?;
+        let identity = e2e::Identity::restore(&backup, &password).map_err(e2e_error)?;
+        Ok(Self { inner: RefCell::new(Some(identity)) })
+    }
+
+    #[wasm_bindgen(js_name = exportPrivate)]
+    pub fn export_private(&self) -> Result<Uint8Array, JsValue> {
+        let identity = self.identity()?;
+        let mut private = identity.private_key();
+        let result = Uint8Array::from(private.as_slice());
+        private.zeroize();
+        Ok(result)
+    }
+
+    #[wasm_bindgen(js_name = publicKey)]
+    pub fn public_key(&self) -> Result<String, JsValue> {
+        Ok(STANDARD.encode(self.identity()?.public_key()))
+    }
+
+    pub fn fingerprint(&self) -> Result<String, JsValue> { Ok(self.identity()?.fingerprint()) }
+
+    #[wasm_bindgen(js_name = sealMessage)]
+    pub fn seal_message(&self, peer_public_key: String, from: String, to: String, plaintext: Uint8Array) -> Result<JsValue, JsValue> {
+        let peer = parse_e2e_public(&peer_public_key)?;
+        let mut bytes = vec![0; plaintext.length() as usize]; plaintext.copy_to(&mut bytes);
+        let envelope = self.identity()?.seal(peer, &from, &to, &bytes).map_err(e2e_error)?;
+        bytes.zeroize();
+        envelope_to_js(&envelope)
+    }
+
+    #[wasm_bindgen(js_name = openMessage)]
+    pub fn open_message(&self, peer_public_key: String, from: String, to: String, envelope: JsValue) -> Result<Uint8Array, JsValue> {
+        let peer = parse_e2e_public(&peer_public_key)?;
+        let envelope = parse_envelope(envelope)?;
+        let mut plaintext = self.identity()?.open(peer, &from, &to, &envelope).map_err(e2e_error)?;
+        let result = Uint8Array::from(plaintext.as_slice());
+        plaintext.zeroize();
+        Ok(result)
+    }
+
+    #[wasm_bindgen(js_name = createBackup)]
+    pub fn create_backup(&self, password: String) -> Result<JsValue, JsValue> {
+        let backup = self.identity()?.backup(&password).map_err(e2e_error)?;
+        backup_to_js(&backup)
+    }
+
+    #[wasm_bindgen(js_name = encryptedMediaSize)]
+    pub fn encrypted_media_size(&self, plaintext_size: u64) -> Result<u64, JsValue> {
+        e2e::encrypted_media_size(plaintext_size).map_err(e2e_error)
+    }
+
+    pub fn close(&self) { self.inner.borrow_mut().take(); }
+}
+
+impl Mst5E2eIdentity {
+    fn identity(&self) -> Result<std::cell::Ref<'_, e2e::Identity>, JsValue> {
+        std::cell::Ref::filter_map(self.inner.borrow(), |value| value.as_ref())
+            .map_err(|_| JsValue::from_str("E2E identity is closed"))
+    }
+}
+
 /// Stateful, browser-safe MST5 client. All secure-transport and frame logic
 /// remains in Rust/WASM. JavaScript passes only messenger JSON commands.
 #[wasm_bindgen]
@@ -536,6 +656,54 @@ impl Mst5Web {
         })
     }
 
+    /// Opens a media stream that encrypts each attachment chunk with the
+    /// sender/recipient E2E session key. The upload reservation must be for
+    /// `Identity.encryptedMediaSize(plaintext_size)` bytes.
+    #[wasm_bindgen(js_name = beginE2eMediaUpload)]
+    pub async fn begin_e2e_media_upload(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        ticket: String,
+        file_id: String,
+        plaintext_size: u64,
+        identity: &Mst5E2eIdentity,
+        peer_public_key: String,
+        from: String,
+        to: String,
+    ) -> Result<Mst5E2eMediaUpload, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || plaintext_size == 0 {
+            return Err(JsValue::from_str(
+                "media ticket, file id and plaintext size are required",
+            ));
+        }
+        let encrypted_size = e2e::encrypted_media_size(plaintext_size).map_err(e2e_error)?;
+        let expected_size = usize::try_from(encrypted_size)
+            .map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        let peer = parse_e2e_public(&peer_public_key)?;
+        let encryptor = identity
+            .identity()?
+            .media_encryptor(peer, &from, &to, &file_id, plaintext_size)
+            .map_err(e2e_error)?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(
+            m5ohs_endpoint,
+            destination,
+            REQUIRED_MEDIA_FEATURES,
+        )
+        .await?;
+        media_authenticate(&mut session, ticket).await?;
+        let mut upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
+        upload.write(&encryptor.header()).await?;
+        Ok(Mst5E2eMediaUpload {
+            inner: RefCell::new(Some(BrowserE2eMediaUpload {
+                upload,
+                encryptor,
+                pending: Vec::with_capacity(e2e::MEDIA_CHUNK_SIZE),
+            })),
+        })
+    }
+
     /// Downloads one media object over a separate encrypted MST5 media stream.
     /// The ticket is obtained by the authenticated messenger session via
     /// `/file/ticket`; it authorizes exactly one file and expires quickly.
@@ -572,6 +740,55 @@ impl Mst5Web {
         Ok(Uint8Array::from(bytes.as_slice()))
     }
 
+    /// Downloads and decrypts an E2E media container incrementally. Ciphertext
+    /// frames are authenticated and released immediately; only the final
+    /// plaintext browser object is materialized for Blob display/download.
+    #[wasm_bindgen(js_name = downloadE2eMedia)]
+    pub async fn download_e2e_media(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        ticket: String,
+        file_id: String,
+        expected_size: u64,
+        identity: &Mst5E2eIdentity,
+        peer_public_key: String,
+        from: String,
+        to: String,
+    ) -> Result<Uint8Array, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 {
+            return Err(JsValue::from_str(
+                "media ticket, file id and expected size are required",
+            ));
+        }
+        let expected_size = usize::try_from(expected_size)
+            .map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        if expected_size > MAX_BROWSER_DOWNLOAD_BYTES {
+            return Err(JsValue::from_str(
+                "media file exceeds the browser download memory limit",
+            ));
+        }
+        let peer = parse_e2e_public(&peer_public_key)?;
+        let decryptor = identity
+            .identity()?
+            .media_decryptor(peer, &from, &to, &file_id)
+            .map_err(e2e_error)?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(
+            m5ohs_endpoint,
+            destination,
+            REQUIRED_MEDIA_FEATURES,
+        )
+        .await?;
+        media_authenticate(&mut session, ticket).await?;
+        let mut plaintext = session
+            .download_e2e_media(&file_id, expected_size, decryptor)
+            .await?;
+        let result = Uint8Array::from(plaintext.as_slice());
+        plaintext.zeroize();
+        Ok(result)
+    }
+
     #[wasm_bindgen]
     pub async fn close(&self) -> Result<(), JsValue> {
         *self.inner.borrow_mut() = None;
@@ -585,6 +802,44 @@ fn auth_session_token(value: &JsonValue) -> Option<String> {
         .and_then(JsonValue::as_str)
         .filter(|token| !token.trim().is_empty())
         .map(str::to_owned)
+}
+
+fn e2e_error(error: std::io::Error) -> JsValue { JsValue::from_str(&error.to_string()) }
+
+fn decode_e2e(value: &str, field: &str, expected: Option<usize>) -> Result<Vec<u8>, JsValue> {
+    let bytes = STANDARD.decode(value).map_err(|_| JsValue::from_str(&format!("invalid E2E {field}")))?;
+    if expected.is_some_and(|size| bytes.len() != size) { return Err(JsValue::from_str(&format!("invalid E2E {field} length"))); }
+    Ok(bytes)
+}
+
+fn parse_e2e_public(value: &str) -> Result<[u8; 32], JsValue> {
+    decode_e2e(value, "public key", Some(32))?.try_into().map_err(|_| JsValue::from_str("invalid E2E public key"))
+}
+
+fn envelope_to_js(value: &e2e::Envelope) -> Result<JsValue, JsValue> {
+    E2eEnvelopeJson { version: value.version, nonce: STANDARD.encode(value.nonce), ciphertext: STANDARD.encode(&value.ciphertext) }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|_| JsValue::from_str("cannot encode E2E envelope"))
+}
+
+fn parse_envelope(value: JsValue) -> Result<e2e::Envelope, JsValue> {
+    let raw: E2eEnvelopeJson = serde_wasm_bindgen::from_value(value).map_err(|_| JsValue::from_str("invalid E2E envelope"))?;
+    let nonce: [u8; 24] = decode_e2e(&raw.nonce, "nonce", Some(24))?.try_into().map_err(|_| JsValue::from_str("invalid E2E nonce"))?;
+    let ciphertext = decode_e2e(&raw.ciphertext, "ciphertext", None)?;
+    Ok(e2e::Envelope { version: raw.version, nonce, ciphertext })
+}
+
+fn backup_to_js(value: &e2e::Backup) -> Result<JsValue, JsValue> {
+    E2eBackupJson { version: value.version, salt: STANDARD.encode(value.salt), nonce: STANDARD.encode(value.nonce), ciphertext: STANDARD.encode(&value.ciphertext) }
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|_| JsValue::from_str("cannot encode E2E backup"))
+}
+
+fn parse_backup(value: JsValue) -> Result<e2e::Backup, JsValue> {
+    let raw: E2eBackupJson = serde_wasm_bindgen::from_value(value).map_err(|_| JsValue::from_str("invalid E2E backup"))?;
+    let salt: [u8; 16] = decode_e2e(&raw.salt, "backup salt", Some(16))?.try_into().map_err(|_| JsValue::from_str("invalid E2E backup salt"))?;
+    let nonce: [u8; 24] = decode_e2e(&raw.nonce, "backup nonce", Some(24))?.try_into().map_err(|_| JsValue::from_str("invalid E2E backup nonce"))?;
+    Ok(e2e::Backup { version: raw.version, salt, nonce, ciphertext: decode_e2e(&raw.ciphertext, "backup ciphertext", None)? })
 }
 
 #[wasm_bindgen]
@@ -625,6 +880,62 @@ impl Mst5MediaUpload {
         let upload = self.inner.borrow_mut().take();
         if let Some(mut upload) = upload {
             upload.abort().await?;
+        }
+        Ok(())
+    }
+}
+
+#[wasm_bindgen]
+impl Mst5E2eMediaUpload {
+    /// Encrypts a browser stream chunk. It accepts arbitrary chunk boundaries
+    /// while preserving the fixed chunking authenticated by the E2E format.
+    #[wasm_bindgen]
+    pub async fn write(&self, data: Uint8Array) -> Result<(), JsValue> {
+        if data.length() == 0 {
+            return Ok(());
+        }
+        let mut bytes = vec![0; data.length() as usize];
+        data.copy_to(&mut bytes);
+        let mut borrow = self.inner.borrow_mut();
+        let upload = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("E2E media upload is already closed"))?;
+        upload.pending.extend_from_slice(&bytes);
+        bytes.zeroize();
+        while upload.pending.len() >= e2e::MEDIA_CHUNK_SIZE {
+            let chunk: Vec<u8> = upload.pending.drain(..e2e::MEDIA_CHUNK_SIZE).collect();
+            let mut sealed = upload.encryptor.seal_chunk(&chunk).map_err(e2e_error)?;
+            upload.upload.write(&sealed).await?;
+            sealed.zeroize();
+        }
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn finish(&self) -> Result<(), JsValue> {
+        let mut borrow = self.inner.borrow_mut();
+        let upload = borrow
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("E2E media upload is already closed"))?;
+        if !upload.pending.is_empty() {
+            let mut chunk = std::mem::take(&mut upload.pending);
+            let mut sealed = upload.encryptor.seal_chunk(&chunk).map_err(e2e_error)?;
+            chunk.zeroize();
+            upload.upload.write(&sealed).await?;
+            sealed.zeroize();
+        }
+        upload.encryptor.finish().map_err(e2e_error)?;
+        upload.upload.finish().await?;
+        *borrow = None;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn abort(&self) -> Result<(), JsValue> {
+        let upload = self.inner.borrow_mut().take();
+        if let Some(mut upload) = upload {
+            upload.pending.zeroize();
+            upload.upload.abort().await?;
         }
         Ok(())
     }
@@ -926,6 +1237,75 @@ impl BrowserSession {
                         return Err(JsValue::from_str("MST5 media download checksum mismatch"));
                     }
                     return Ok(data);
+                }
+                MST5_KIND_ERROR => return Err(frame_error("media download failed", &frame)),
+                _ => return Err(JsValue::from_str("unexpected MST5 media download frame")),
+            }
+        }
+    }
+
+    async fn download_e2e_media(
+        &mut self,
+        file_id: &str,
+        expected_size: usize,
+        mut decryptor: e2e::MediaDecryptor,
+    ) -> Result<Vec<u8>, JsValue> {
+        let id = self.take_request_id()?;
+        let payload = serde_cbor::to_vec(&serde_json::json!({"file_id": file_id}))
+            .map_err(|_| JsValue::from_str("cannot encode media download open"))?;
+        self.write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_DOWNLOAD, id, &payload)
+            .await?;
+        let accepted = self.read_matching_frame(id).await?;
+        if accepted.kind != MST5_KIND_ACK || accepted.code != 100 {
+            return Err(frame_error("media download was rejected", &accepted));
+        }
+        let metadata: JsonValue = serde_cbor::from_slice(&accepted.payload)
+            .map_err(|_| JsValue::from_str("invalid media download acknowledgement"))?;
+        let announced = metadata
+            .get("size")
+            .and_then(JsonValue::as_u64)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| JsValue::from_str("media node omitted a valid file size"))?;
+        if announced != expected_size {
+            return Err(JsValue::from_str("media file size changed before download"));
+        }
+
+        let mut ciphertext_size = 0usize;
+        let mut plaintext = Vec::with_capacity(announced);
+        let mut digest = Sha256::new();
+        loop {
+            let frame = self.read_matching_frame(id).await?;
+            match frame.kind {
+                MST5_KIND_STREAM_DATA => {
+                    if frame.payload.is_empty()
+                        || frame.payload.len() > BROWSER_MEDIA_CHUNK
+                        || ciphertext_size.saturating_add(frame.payload.len()) > announced
+                    {
+                        return Err(JsValue::from_str("invalid MST5 media download chunk"));
+                    }
+                    digest.update(&frame.payload);
+                    ciphertext_size += frame.payload.len();
+                    for mut chunk in decryptor.push(&frame.payload).map_err(e2e_error)? {
+                        plaintext.append(&mut chunk);
+                    }
+                }
+                MST5_KIND_STREAM_END => {
+                    let end: JsonValue = serde_cbor::from_slice(&frame.payload)
+                        .map_err(|_| JsValue::from_str("invalid media download end"))?;
+                    let checksum = hex_bytes(&digest.finalize());
+                    if ciphertext_size != announced
+                        || end.get("size").and_then(JsonValue::as_u64)
+                            != Some(ciphertext_size as u64)
+                        || end.get("sha256").and_then(JsonValue::as_str)
+                            != Some(checksum.as_str())
+                    {
+                        return Err(JsValue::from_str("MST5 media download checksum mismatch"));
+                    }
+                    let recovered = decryptor.finish().map_err(e2e_error)?;
+                    if plaintext.len() as u64 != recovered {
+                        return Err(JsValue::from_str("E2E media size mismatch"));
+                    }
+                    return Ok(plaintext);
                 }
                 MST5_KIND_ERROR => return Err(frame_error("media download failed", &frame)),
                 _ => return Err(JsValue::from_str("unexpected MST5 media download frame")),

@@ -1,6 +1,6 @@
 [package]
 name = "mst5-client"
-version = "0.7.20"
+version = "0.7.21"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Complete asynchronous client for the MST5.1 protocol"
@@ -10,6 +10,7 @@ default = ["m5oh-tls"]
 m5oh-tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [dependencies]
+mst5-e2e-core = { path = "e2e-core" }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 getrandom = "0.3.3"

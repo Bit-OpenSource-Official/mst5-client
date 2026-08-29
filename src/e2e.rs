@@ -126,6 +126,13 @@ impl Identity {
         *self.public.as_bytes()
     }
 
+    /// Returns a copy for platform key stores. Callers must persist it only
+    /// through an OS/browser protected keystore and should zeroize the copy
+    /// immediately after handing it off.
+    pub fn private_key(&self) -> [u8; 32] {
+        self.private.to_bytes()
+    }
+
     pub fn fingerprint(&self) -> String {
         fingerprint(self.public.as_bytes())
     }

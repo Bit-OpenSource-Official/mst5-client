@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-client"
-version = "0.7.20"
+version = "0.7.21"
 dependencies = [
  "argon2",
  "bytes",
@@ -436,6 +436,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "miniz_oxide 0.9.1",
+ "mst5-e2e-core",
  "rustls",
  "serde",
  "serde_json",
@@ -451,12 +452,26 @@ dependencies = [
 
 [[package]]
 name = "mst5-client-ffi"
-version = "0.7.20"
+version = "0.7.21"
 dependencies = [
  "cc",
  "mst5-client",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "mst5-e2e-core"
+version = "0.7.21"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "getrandom 0.3.4",
+ "hkdf",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
+ "zstd",
 ]
 
 [[package]]

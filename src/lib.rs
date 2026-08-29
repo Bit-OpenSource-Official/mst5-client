@@ -20,7 +20,7 @@ use zeroize::Zeroize;
 
 mod account;
 mod connection;
-pub mod e2e;
+pub use mst5_e2e_core as e2e;
 pub mod image;
 mod m5oh;
 pub mod messenger;
