@@ -796,6 +796,30 @@ impl Mst5Web {
         })
     }
 
+    /// Opens an E2E media stream with a caller-supplied 32-byte key. This is
+    /// used by group media: the file is encrypted once, while the key itself
+    /// is wrapped in the per-recipient group envelope.
+    #[wasm_bindgen(js_name = beginE2eMediaUploadWithKey)]
+    pub async fn begin_e2e_media_upload_with_key(
+        &self, m5ohs_endpoint: String, media_endpoint: String, ticket: String,
+        file_id: String, plaintext_size: u64, media_key: String, file_aad: String,
+    ) -> Result<Mst5E2eMediaUpload, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || plaintext_size == 0 {
+            return Err(JsValue::from_str("media ticket, file id and plaintext size are required"));
+        }
+        let key = decode_e2e(&media_key, "media key", Some(32))?;
+        let encrypted_size = e2e::encrypted_media_size(plaintext_size).map_err(e2e_error)?;
+        let expected_size = usize::try_from(encrypted_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        let aad = STANDARD.decode(file_aad).map_err(|_| JsValue::from_str("invalid media AAD"))?;
+        let encryptor = e2e::MediaEncryptor::with_key(&key, aad, plaintext_size).map_err(e2e_error)?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        media_authenticate(&mut session, ticket).await?;
+        let mut upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
+        upload.write(&encryptor.header()).await?;
+        Ok(Mst5E2eMediaUpload { inner: RefCell::new(Some(BrowserE2eMediaUpload { upload, encryptor, pending: Vec::with_capacity(e2e::MEDIA_CHUNK_SIZE) })) })
+    }
+
     /// Downloads one media object over a separate encrypted MST5 media stream.
     /// The ticket is obtained by the authenticated messenger session via
     /// `/file/ticket`; it authorizes exactly one file and expires quickly.
@@ -900,6 +924,26 @@ impl Mst5Web {
         let mut plaintext = session
             .download_e2e_media(&file_id, expected_size, decryptor)
             .await?;
+        let result = Uint8Array::from(plaintext.as_slice());
+        plaintext.zeroize();
+        Ok(result)
+    }
+
+    #[wasm_bindgen(js_name = downloadE2eMediaWithKey)]
+    pub async fn download_e2e_media_with_key(
+        &self, m5ohs_endpoint: String, media_endpoint: String, ticket: String,
+        file_id: String, expected_size: u64, media_key: String, file_aad: String,
+    ) -> Result<Uint8Array, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 { return Err(JsValue::from_str("media ticket, file id and expected size are required")); }
+        let expected_size = usize::try_from(expected_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        if expected_size > MAX_BROWSER_DOWNLOAD_BYTES { return Err(JsValue::from_str("media file exceeds the browser download memory limit")); }
+        let key = decode_e2e(&media_key, "media key", Some(32))?;
+        let aad = STANDARD.decode(file_aad).map_err(|_| JsValue::from_str("invalid media AAD"))?;
+        let decryptor = e2e::MediaDecryptor::with_key(&key, aad).map_err(e2e_error)?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        media_authenticate(&mut session, ticket).await?;
+        let mut plaintext = session.download_e2e_media(&file_id, expected_size, decryptor).await?;
         let result = Uint8Array::from(plaintext.as_slice());
         plaintext.zeroize();
         Ok(result)
