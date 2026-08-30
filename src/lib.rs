@@ -1418,6 +1418,35 @@ impl Client {
         from_id: &str,
         to_id: &str,
     ) -> io::Result<()> {
+        let encryptor =
+            identity.media_encryptor(peer_public, from_id, to_id, file_id, plaintext_size)?;
+        self.upload_media_e2e_with_encryptor(file_id, plaintext_size, source, encryptor)
+            .await
+    }
+
+    /// Encrypts a group attachment once with a caller-supplied media key.
+    /// The key is transported separately in the per-recipient group envelope;
+    /// the media node receives only the single ciphertext stream.
+    pub async fn upload_media_e2e_with_key<R: AsyncRead + Unpin>(
+        &self,
+        file_id: &str,
+        plaintext_size: u64,
+        source: &mut R,
+        media_key: [u8; 32],
+        file_aad: Vec<u8>,
+    ) -> io::Result<()> {
+        let encryptor = e2e::MediaEncryptor::with_key(&media_key, file_aad, plaintext_size)?;
+        self.upload_media_e2e_with_encryptor(file_id, plaintext_size, source, encryptor)
+            .await
+    }
+
+    async fn upload_media_e2e_with_encryptor<R: AsyncRead + Unpin>(
+        &self,
+        file_id: &str,
+        plaintext_size: u64,
+        source: &mut R,
+        mut encryptor: e2e::MediaEncryptor,
+    ) -> io::Result<()> {
         let encrypted_size = e2e::encrypted_media_size(plaintext_size)?;
         if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
             return Err(io::Error::new(
@@ -1448,8 +1477,6 @@ impl Client {
                 "media upload rejected",
             ));
         }
-        let mut encryptor =
-            identity.media_encryptor(peer_public, from_id, to_id, file_id, plaintext_size)?;
         let header = encryptor.header();
         let mut hasher = Sha256::new();
         let mut sent = 0u64;
@@ -1607,6 +1634,34 @@ impl Client {
         from_id: &str,
         to_id: &str,
     ) -> io::Result<u64> {
+        let decryptor = identity.media_decryptor(peer_public, from_id, to_id, file_id)?;
+        self.download_media_e2e_with_decryptor(file_id, expected_encrypted_size, target, decryptor)
+            .await
+    }
+
+    /// Downloads group E2E media with the key recovered from the group
+    /// envelope. Decryption remains streaming and never materializes the
+    /// ciphertext or complete plaintext in the managed caller.
+    pub async fn download_media_e2e_with_key<W: AsyncWrite + Unpin>(
+        &self,
+        file_id: &str,
+        expected_encrypted_size: u64,
+        target: &mut W,
+        media_key: [u8; 32],
+        file_aad: Vec<u8>,
+    ) -> io::Result<u64> {
+        let decryptor = e2e::MediaDecryptor::with_key(&media_key, file_aad)?;
+        self.download_media_e2e_with_decryptor(file_id, expected_encrypted_size, target, decryptor)
+            .await
+    }
+
+    async fn download_media_e2e_with_decryptor<W: AsyncWrite + Unpin>(
+        &self,
+        file_id: &str,
+        expected_encrypted_size: u64,
+        target: &mut W,
+        mut decryptor: e2e::MediaDecryptor,
+    ) -> io::Result<u64> {
         if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1641,7 +1696,6 @@ impl Client {
             pending.abort(409).await;
             return Err(invalid_data("media size changed"));
         }
-        let mut decryptor = identity.media_decryptor(peer_public, from_id, to_id, file_id)?;
         let mut hasher = Sha256::new();
         let mut received = 0u64;
         let mut plaintext = 0u64;
