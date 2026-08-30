@@ -231,6 +231,7 @@ pub mod op {
     pub const ACCOUNT_INACTIVITY_GET: u16 = 90;
     pub const ACCOUNT_INACTIVITY_SET: u16 = 91;
     pub const PIN: u16 = 92;
+    pub const POLL_VOTE: u16 = 93;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2398,6 +2399,13 @@ impl Client {
             ("id", Value::Integer(id)), ("pinned", Value::Bool(pinned)),
         ])).await?;
         message_from_result(&value, "pin_message response")
+    }
+
+    pub async fn vote_poll(&self, message_id: i64, option: i64) -> io::Result<Message> {
+        let value = self.command_result(op::POLL_VOTE, Value::map([
+            ("message_id", Value::Integer(message_id)), ("option", Value::Integer(option)),
+        ])).await?;
+        message_from_result(&value, "vote_poll response")
     }
 
     pub async fn callback<T: ToString>(

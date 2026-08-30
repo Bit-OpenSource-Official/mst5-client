@@ -380,6 +380,7 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("POST", "/send") => op::SEND,
         ("POST", "/edit") => op::EDIT,
         ("POST", "/pin") => op::PIN,
+        ("POST", "/polls/vote") => op::POLL_VOTE,
         ("POST", "/callback") => op::CALLBACK,
         ("POST", "/reactions") => op::REACT,
         ("POST", "/reactions/paid") => op::REACT_PAID,
