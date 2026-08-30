@@ -1294,6 +1294,51 @@ impl Client {
         Ok(())
     }
 
+    /// Resumes an interrupted upload. `source` must contain bytes starting at
+    /// `offset`; `sha256` is the checksum of the complete file (including the
+    /// already persisted prefix). The media node validates the prefix before
+    /// appending, so retrying is safe and idempotent.
+    pub async fn upload_media_resumable<R: AsyncRead + Unpin>(
+        &self,
+        file_id: &str,
+        size: u64,
+        offset: u64,
+        sha256: &str,
+        source: &mut R,
+    ) -> io::Result<()> {
+        if offset > size || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid_data("invalid resumable upload checkpoint"));
+        }
+        if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "media client is not authenticated"));
+        }
+        let open = Value::map([("file_id", Value::from(file_id)), ("size", Value::from(size)), ("offset", Value::from(offset))]);
+        let deadline_ms = unix_now_ms().saturating_add(duration_ms(self.read_timeout));
+        let mut pending = self.connection.begin(kind::STREAM_OPEN, media_op::UPLOAD, [0; 16], deadline_ms, open.encode_cbor()).await?;
+        let accepted = pending.recv(self.read_timeout).await?;
+        if accepted.id != pending.id() || accepted.kind != kind::ACK || accepted.code != 100 {
+            pending.remove().await;
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "media upload rejected"));
+        }
+        let accepted_offset = Value::decode_cbor(&accepted.payload)?.get("offset").and_then(Value::as_u64).unwrap_or(offset);
+        if accepted_offset != offset { pending.remove().await; return Err(invalid_data("media node checkpoint mismatch")); }
+        let mut sent = offset;
+        let mut buffer = vec![0u8; MEDIA_CHUNK_SIZE];
+        loop {
+            let count = match source.read(&mut buffer).await { Ok(count) => count, Err(error) => { pending.abort(500).await; return Err(error); } };
+            if count == 0 { break; }
+            sent = sent.saturating_add(count as u64);
+            if sent > size { pending.abort(400).await; return Err(invalid_data("media source exceeds declared size")); }
+            let payload = buffer[..count].to_vec();
+            if let Err(error) = pending.send(kind::STREAM_DATA, 0, payload).await { pending.abort(500).await; return Err(error); }
+        }
+        if sent != size { pending.abort(400).await; return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "media source is shorter than declared size")); }
+        pending.send(kind::STREAM_END, 200, Value::map([("size", Value::from(size)), ("sha256", Value::from(sha256))]).encode_cbor()).await?;
+        let response = Response::from_frame(pending.recv(self.read_timeout).await?);
+        if response.kind != kind::RESULT || response.status != 200 { return response.into_result().map(|_| ()); }
+        Ok(())
+    }
+
     /// Encrypts `source` directly into the media upload stream. Neither the
     /// managed caller nor the filesystem ever holds a complete ciphertext.
     pub async fn upload_media_e2e<R: AsyncRead + Unpin>(
