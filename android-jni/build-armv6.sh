@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-output_dir="${1:-${script_dir}/../../android-client/app/src/main/assets/mst5-native}"
+output_dir="${1:-${script_dir}/../../messenger-clients/android-client/app/src/main/assets/mst5-native}"
 cabi_output_dir="${2:-}"
 ndk_root="${ANDROID_NDK_R14_HOME:-}"
 toolchain="${ARMV6_ANDROID_TOOLCHAIN:-${script_dir}/target/android-api9-arm-toolchain}"

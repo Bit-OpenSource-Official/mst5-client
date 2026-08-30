@@ -104,7 +104,7 @@ Java byte arrays.
 Build the ARM libraries into a sibling Android checkout with:
 
 ```bash
-./android-jni/build-android.sh ../android-client/app/src/main/assets/mst5-native
+./android-jni/build-android.sh ../messenger-clients/android-client/app/src/main/assets/mst5-native
 ```
 
 The regular ARMv7 and ARM64 builds target API 21. The bridge also supports the
@@ -117,7 +117,7 @@ Build the ARMv6/API 9 library with an extracted NDK r14b:
 
 ```bash
 ANDROID_NDK_R14_HOME=/opt/android-ndk-r14b \
-  ./android-jni/build-armv6.sh ../android-client/app/src/main/assets/mst5-native
+  ./android-jni/build-armv6.sh ../messenger-clients/android-client/app/src/main/assets/mst5-native
 ```
 
 ## Recipient identifiers

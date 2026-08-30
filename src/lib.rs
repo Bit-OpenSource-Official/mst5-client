@@ -22,6 +22,7 @@ mod account;
 mod connection;
 pub use mst5_e2e_core as e2e;
 pub mod image;
+pub mod outbox;
 mod m5oh;
 pub mod messenger;
 pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
