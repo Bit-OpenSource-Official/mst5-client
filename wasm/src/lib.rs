@@ -256,6 +256,8 @@ mod tests {
             (("POST", "/stickers/packs/purchase"), 83),
             (("POST", "/stickers/send"), 84),
             (("POST", "/stickers/packs/price"), 85),
+            (("POST", "/pin"), 92),
+            (("POST", "/polls/vote"), 93),
         ] {
             assert_eq!(
                 operation(method, path).expect("registered operation"),
@@ -1923,6 +1925,8 @@ fn operation(method: &str, path: &str) -> Result<u16, JsValue> {
         ("POST", "/messages/prepare") => 71,
         ("POST", "/messages/commit") => 72,
         ("POST", "/messages/cancel") => 73,
+        ("POST", "/pin") => 92,
+        ("POST", "/polls/vote") => 93,
         ("POST", "/avatars/prepare") => 86,
         ("POST", "/avatars/commit") => 87,
         ("POST", "/avatars/delete") => 88,
