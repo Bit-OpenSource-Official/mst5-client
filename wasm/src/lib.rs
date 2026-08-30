@@ -764,6 +764,30 @@ impl Mst5Web {
         Ok(Uint8Array::from(bytes.as_slice()))
     }
 
+    /// Streams media chunks to JavaScript without materializing the complete
+    /// file. The callback receives one Uint8Array per authenticated MST5
+    /// stream frame; checksum and size are verified before this resolves.
+    #[wasm_bindgen(js_name = downloadMediaStream)]
+    pub async fn download_media_stream(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        ticket: String,
+        file_id: String,
+        expected_size: u64,
+        on_chunk: Function,
+    ) -> Result<(), JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 {
+            return Err(JsValue::from_str("media ticket, file id and expected size are required"));
+        }
+        let expected_size = usize::try_from(expected_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        if expected_size > MAX_BROWSER_DOWNLOAD_BYTES { return Err(JsValue::from_str("media file exceeds the browser download memory limit")); }
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        media_authenticate(&mut session, ticket).await?;
+        session.download_media_stream(&file_id, expected_size, &on_chunk).await
+    }
+
     /// Downloads and decrypts an E2E media container incrementally. Ciphertext
     /// frames are authenticated and released immediately; only the final
     /// plaintext browser object is materialized for Blob display/download.
@@ -1284,6 +1308,36 @@ impl BrowserSession {
                         return Err(JsValue::from_str("MST5 media download checksum mismatch"));
                     }
                     return Ok(data);
+                }
+                MST5_KIND_ERROR => return Err(frame_error("media download failed", &frame)),
+                _ => return Err(JsValue::from_str("unexpected MST5 media download frame")),
+            }
+        }
+    }
+
+    async fn download_media_stream(&mut self, file_id: &str, expected_size: usize, on_chunk: &Function) -> Result<(), JsValue> {
+        let id = self.take_request_id()?;
+        let payload = serde_cbor::to_vec(&serde_json::json!({"file_id": file_id})).map_err(|_| JsValue::from_str("cannot encode media download open"))?;
+        self.write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_DOWNLOAD, id, &payload).await?;
+        let accepted = self.read_matching_frame(id).await?;
+        if accepted.kind != MST5_KIND_ACK || accepted.code != 100 { return Err(frame_error("media download was rejected", &accepted)); }
+        let metadata: JsonValue = serde_cbor::from_slice(&accepted.payload).map_err(|_| JsValue::from_str("invalid media download acknowledgement"))?;
+        let announced = metadata.get("size").and_then(JsonValue::as_u64).and_then(|size| usize::try_from(size).ok()).ok_or_else(|| JsValue::from_str("media node omitted a valid file size"))?;
+        if announced != expected_size { return Err(JsValue::from_str("media file size changed before download")); }
+        let mut received = 0usize; let mut digest = Sha256::new();
+        loop {
+            let frame = self.read_matching_frame(id).await?;
+            match frame.kind {
+                MST5_KIND_STREAM_DATA => {
+                    if frame.payload.is_empty() || frame.payload.len() > BROWSER_MEDIA_CHUNK || received.saturating_add(frame.payload.len()) > announced { return Err(JsValue::from_str("invalid MST5 media download chunk")); }
+                    digest.update(&frame.payload); received += frame.payload.len();
+                    let chunk = Uint8Array::from(frame.payload.as_slice()); on_chunk.call1(&JsValue::UNDEFINED, &chunk.into())?;
+                }
+                MST5_KIND_STREAM_END => {
+                    let end: JsonValue = serde_cbor::from_slice(&frame.payload).map_err(|_| JsValue::from_str("invalid MST5 media download end"))?;
+                    let checksum = hex_bytes(&digest.finalize());
+                    if received != announced || end.get("size").and_then(JsonValue::as_u64) != Some(received as u64) || end.get("sha256").and_then(JsonValue::as_str) != Some(checksum.as_str()) { return Err(JsValue::from_str("MST5 media download checksum mismatch")); }
+                    return Ok(());
                 }
                 MST5_KIND_ERROR => return Err(frame_error("media download failed", &frame)),
                 _ => return Err(JsValue::from_str("unexpected MST5 media download frame")),
