@@ -42,11 +42,29 @@ MST5_API int32_t mst5_client_connect(const char *endpoint, const char *server_pu
                                      mst5_client_t *out_client);
 MST5_API int32_t mst5_client_connect_compiled(const char *endpoint,
                                               mst5_client_t *out_client);
+MST5_API int32_t mst5_client_connect_media(const char *endpoint,
+                                           const char *server_public_key_b64,
+                                           const char *ticket,
+                                           mst5_client_t *out_client);
 MST5_API int32_t mst5_client_authenticate(mst5_client_t client, const char *token);
 MST5_API int32_t mst5_client_request(mst5_client_t client, uint8_t kind, uint16_t opcode,
                                      const uint8_t *payload, size_t payload_len,
                                      uint64_t deadline_ms, mst5_buffer *out_response);
+MST5_API int32_t mst5_client_request_with_nonce(mst5_client_t client, uint8_t kind, uint16_t opcode,
+                                                const uint8_t *payload, size_t payload_len,
+                                                const uint8_t nonce[16], uint64_t deadline_ms,
+                                                mst5_buffer *out_response);
 MST5_API int32_t mst5_client_close(mst5_client_t client);
+MST5_API int32_t mst5_client_media_upload(mst5_client_t client, const char *file_id,
+                                          const uint8_t *data, size_t data_len);
+MST5_API int32_t mst5_client_media_download(mst5_client_t client, const char *file_id,
+                                            mst5_buffer *out_data);
+MST5_API int32_t mst5_client_media_stat(mst5_client_t client, const char *file_id,
+                                        uint64_t *out_size);
+MST5_API int32_t mst5_client_media_delete(mst5_client_t client, const char *file_id);
+MST5_API int32_t mst5_client_request_json(mst5_client_t client, uint8_t kind, uint16_t opcode,
+                                          const char *json_payload, uint64_t deadline_ms,
+                                          mst5_buffer *out_json);
 
 MST5_API int32_t mst5_identity_open(const char *private_store_path, int32_t create,
                                     mst5_identity_t *out_identity);
