@@ -22,9 +22,9 @@ mod account;
 mod connection;
 pub use mst5_e2e_core as e2e;
 pub mod image;
-pub mod outbox;
 mod m5oh;
 pub mod messenger;
+pub mod outbox;
 pub use account::{AccountClient, AccountConfig, AccountEvent, AccountEventReceiver};
 use connection::Mst5Connection;
 
@@ -1323,32 +1323,86 @@ impl Client {
             return Err(invalid_data("invalid resumable upload checkpoint"));
         }
         if !self.is_authenticated() || self.features & FEATURE_MEDIA_STREAMS == 0 {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "media client is not authenticated"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "media client is not authenticated",
+            ));
         }
-        let open = Value::map([("file_id", Value::from(file_id)), ("size", Value::from(size)), ("offset", Value::from(offset))]);
+        let open = Value::map([
+            ("file_id", Value::from(file_id)),
+            ("size", Value::from(size)),
+            ("offset", Value::from(offset)),
+        ]);
         let deadline_ms = unix_now_ms().saturating_add(duration_ms(self.read_timeout));
-        let mut pending = self.connection.begin(kind::STREAM_OPEN, media_op::UPLOAD, [0; 16], deadline_ms, open.encode_cbor()).await?;
+        let mut pending = self
+            .connection
+            .begin(
+                kind::STREAM_OPEN,
+                media_op::UPLOAD,
+                [0; 16],
+                deadline_ms,
+                open.encode_cbor(),
+            )
+            .await?;
         let accepted = pending.recv(self.read_timeout).await?;
         if accepted.id != pending.id() || accepted.kind != kind::ACK || accepted.code != 100 {
             pending.remove().await;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "media upload rejected"));
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "media upload rejected",
+            ));
         }
-        let accepted_offset = Value::decode_cbor(&accepted.payload)?.get("offset").and_then(Value::as_u64).unwrap_or(offset);
-        if accepted_offset != offset { pending.remove().await; return Err(invalid_data("media node checkpoint mismatch")); }
+        let accepted_offset = Value::decode_cbor(&accepted.payload)?
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(offset);
+        if accepted_offset != offset {
+            pending.remove().await;
+            return Err(invalid_data("media node checkpoint mismatch"));
+        }
         let mut sent = offset;
         let mut buffer = vec![0u8; MEDIA_CHUNK_SIZE];
         loop {
-            let count = match source.read(&mut buffer).await { Ok(count) => count, Err(error) => { pending.abort(500).await; return Err(error); } };
-            if count == 0 { break; }
+            let count = match source.read(&mut buffer).await {
+                Ok(count) => count,
+                Err(error) => {
+                    pending.abort(500).await;
+                    return Err(error);
+                }
+            };
+            if count == 0 {
+                break;
+            }
             sent = sent.saturating_add(count as u64);
-            if sent > size { pending.abort(400).await; return Err(invalid_data("media source exceeds declared size")); }
+            if sent > size {
+                pending.abort(400).await;
+                return Err(invalid_data("media source exceeds declared size"));
+            }
             let payload = buffer[..count].to_vec();
-            if let Err(error) = pending.send(kind::STREAM_DATA, 0, payload).await { pending.abort(500).await; return Err(error); }
+            if let Err(error) = pending.send(kind::STREAM_DATA, 0, payload).await {
+                pending.abort(500).await;
+                return Err(error);
+            }
         }
-        if sent != size { pending.abort(400).await; return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "media source is shorter than declared size")); }
-        pending.send(kind::STREAM_END, 200, Value::map([("size", Value::from(size)), ("sha256", Value::from(sha256))]).encode_cbor()).await?;
+        if sent != size {
+            pending.abort(400).await;
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "media source is shorter than declared size",
+            ));
+        }
+        pending
+            .send(
+                kind::STREAM_END,
+                200,
+                Value::map([("size", Value::from(size)), ("sha256", Value::from(sha256))])
+                    .encode_cbor(),
+            )
+            .await?;
         let response = Response::from_frame(pending.recv(self.read_timeout).await?);
-        if response.kind != kind::RESULT || response.status != 200 { return response.into_result().map(|_| ()); }
+        if response.kind != kind::RESULT || response.status != 200 {
+            return response.into_result().map(|_| ());
+        }
         Ok(())
     }
 
@@ -2402,16 +2456,25 @@ impl Client {
     }
 
     pub async fn pin_message(&self, id: i64, pinned: bool) -> io::Result<Message> {
-        let value = self.command_result(op::PIN, Value::map([
-            ("id", Value::Integer(id)), ("pinned", Value::Bool(pinned)),
-        ])).await?;
+        let value = self
+            .command_result(
+                op::PIN,
+                Value::map([("id", Value::Integer(id)), ("pinned", Value::Bool(pinned))]),
+            )
+            .await?;
         message_from_result(&value, "pin_message response")
     }
 
     pub async fn vote_poll(&self, message_id: i64, option: i64) -> io::Result<Message> {
-        let value = self.command_result(op::POLL_VOTE, Value::map([
-            ("message_id", Value::Integer(message_id)), ("option", Value::Integer(option)),
-        ])).await?;
+        let value = self
+            .command_result(
+                op::POLL_VOTE,
+                Value::map([
+                    ("message_id", Value::Integer(message_id)),
+                    ("option", Value::Integer(option)),
+                ]),
+            )
+            .await?;
         message_from_result(&value, "vote_poll response")
     }
 
@@ -3774,22 +3837,6 @@ fn parse_endpoint(endpoint: &str) -> io::Result<ParsedEndpoint> {
             m5oh: Some(endpoint),
         });
     }
-    if let Some(address) = value.strip_prefix("m5ohs://") {
-        let (endpoint, route) = parse_m5oh_endpoint(address, 443, true)?;
-        return Ok(ParsedEndpoint {
-            address: String::new(),
-            route,
-            m5oh: Some(endpoint),
-        });
-    }
-    if let Some(address) = value.strip_prefix("m5oh://") {
-        let (endpoint, route) = parse_m5oh_endpoint(address, 80, false)?;
-        return Ok(ParsedEndpoint {
-            address: String::new(),
-            route,
-            m5oh: Some(endpoint),
-        });
-    }
     if value.starts_with("tcps://") {
         return Err(invalid_input(
             "MST5 endpoint must use tcp://host:port, mst5://host:port/route, http://host, or https://host",
@@ -3825,15 +3872,17 @@ fn parse_m5oh_endpoint(
     let (address, route) = match value.split_once('/') {
         Some((address, "")) => (address, None),
         Some((address, route)) => {
-            // `IPv4:port` selects the opaque packet route. Other route IDs
-            // remain supported temporarily for saved endpoints.
+            // The HTTP transport only accepts opaque packet destinations.
+            // Human-readable route IDs belonged to the removed legacy router.
             if route
                 .parse::<std::net::SocketAddrV4>()
                 .ok()
                 .filter(|address| address.port() != 0)
                 .is_none()
             {
-                validate_route_id(route)?;
+                return Err(invalid_input(
+                    "M5oH endpoint must use an IP:port packet destination",
+                ));
             }
             (address, Some(route.to_string()))
         }
@@ -4226,7 +4275,7 @@ mod tests {
         assert!(parse_endpoint("mst5://ms.ove.rs:8067/MEDIA").is_err());
         assert!(parse_endpoint("mst5://ms.ove.rs:8067").is_err());
         assert_eq!(
-            parse_endpoint("m5ohs://m5oh.ms.ove.rs").unwrap(),
+            parse_endpoint("https://m5oh.ms.ove.rs").unwrap(),
             ParsedEndpoint {
                 address: String::new(),
                 route: None,
@@ -4254,16 +4303,16 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_endpoint("http://central-1-cdn.ms.sectorlambda.ru/main").unwrap(),
+            parse_endpoint("http://central-1-cdn.ms.sectorlambda.ru/10.100.2.228:8080").unwrap(),
             ParsedEndpoint {
                 address: String::new(),
-                route: Some("main".to_string()),
+                route: Some("10.100.2.228:8080".to_string()),
                 m5oh: Some(m5oh::Endpoint {
                     host: "central-1-cdn.ms.sectorlambda.ru".to_string(),
                     port: 80,
                     tls: false,
-                    route: Some("main".to_string()),
-                    packet_destination: None,
+                    route: Some("10.100.2.228:8080".to_string()),
+                    packet_destination: Some("10.100.2.228:8080".parse().unwrap()),
                 }),
             }
         );

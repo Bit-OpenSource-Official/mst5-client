@@ -105,8 +105,7 @@ impl Outbox {
 
     pub fn claim_ready(&mut self, now_ms: u64) -> Option<String> {
         let item = self.items.iter_mut().find(|item| {
-            item.state == DeliveryState::Queued
-                && item.next_attempt_at_ms <= now_ms
+            item.state == DeliveryState::Queued && item.next_attempt_at_ms <= now_ms
         })?;
         item.state = DeliveryState::Sending;
         item.progress_percent = item.progress_percent.min(99);
@@ -170,7 +169,8 @@ impl Outbox {
     }
 
     pub fn remove_delivered(&mut self) {
-        self.items.retain(|item| item.state != DeliveryState::Delivered);
+        self.items
+            .retain(|item| item.state != DeliveryState::Delivered);
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -205,10 +205,19 @@ mod tests {
     #[test]
     fn queue_transitions_and_round_trips() {
         let mut outbox = Outbox::default();
-        outbox.enqueue(QueueItem::new("m1", "payload").unwrap()).unwrap();
+        outbox
+            .enqueue(QueueItem::new("m1", "payload").unwrap())
+            .unwrap();
         assert_eq!(outbox.claim_ready(u64::MAX).as_deref(), Some("m1"));
         assert!(outbox.update_progress("m1", 42));
-        assert!(outbox.mark_failed("m1", "offline", RetryPolicy { max_attempts: 2, ..Default::default() }));
+        assert!(outbox.mark_failed(
+            "m1",
+            "offline",
+            RetryPolicy {
+                max_attempts: 2,
+                ..Default::default()
+            }
+        ));
         assert_eq!(outbox.items()[0].state, DeliveryState::Queued);
         let restored = Outbox::from_json(&outbox.to_json().unwrap()).unwrap();
         assert_eq!(restored.items(), outbox.items());
@@ -218,9 +227,14 @@ mod tests {
     #[test]
     fn exhausted_item_becomes_failed_and_can_be_retried_manually() {
         let mut outbox = Outbox::default();
-        outbox.enqueue(QueueItem::new("m2", "payload").unwrap()).unwrap();
+        outbox
+            .enqueue(QueueItem::new("m2", "payload").unwrap())
+            .unwrap();
         outbox.claim_ready(u64::MAX);
-        let policy = RetryPolicy { max_attempts: 1, ..Default::default() };
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            ..Default::default()
+        };
         outbox.mark_failed("m2", "bad", policy);
         assert_eq!(outbox.items()[0].state, DeliveryState::Failed);
         assert!(outbox.retry_failed("m2"));

@@ -404,16 +404,8 @@ async fn request_on(
     let method = "GET";
     // The packet-routed form is intentionally ordinary `/?r=...`: the node
     // destination selector is prepended to the Base64URL payload, never
-    // exposed in a URL or header. The route/header form below is legacy-only.
-    let user_agent = if endpoint.packet_destination.is_some() {
-        "OVE-MST5-M5oH/1".to_string()
-    } else {
-        endpoint
-            .route
-            .as_deref()
-            .map(|route| format!("OVE-MST5-M5oH/{route}"))
-            .unwrap_or_else(|| "OVE-MST5-M5oH/1".to_string())
-    };
+    // exposed in a URL or header.
+    let user_agent = "OVE-MST5-M5oH/1";
     let target = get_target(
         endpoint.route.as_deref(),
         endpoint.packet_destination,
@@ -423,13 +415,6 @@ async fn request_on(
         "{method} {target} HTTP/1.1\r\nHost: {}\r\nX-MST5-Session: {session_id}\r\nX-MST5-Channel: {channel}\r\nX-MST5-Seq: {sequence}\r\nAccept: application/octet-stream\r\nUser-Agent: {user_agent}\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n",
         endpoint.host_header(),
     );
-    // TODO(remove-legacy-m5oh-route): delete this once all deployed clients
-    // use the eight-byte packet-destination selector.
-    if endpoint.packet_destination.is_none() {
-        if let Some(route) = &endpoint.route {
-            head.push_str(&format!("X-MST5-Route: {route}\r\n"));
-        }
-    }
     if is_down {
         head.push_str("X-MST5-Max-Response: 8388608\r\n");
     }
@@ -456,7 +441,7 @@ async fn request_on(
 /// Bit.Proxy-compatible GET framing.  Keep the route before the payload so a
 /// shared router can choose the upstream without relying on HTTP methods.
 fn get_target(
-    route: Option<&str>,
+    _route: Option<&str>,
     packet_destination: Option<SocketAddrV4>,
     payload: &[u8],
 ) -> String {
@@ -467,13 +452,10 @@ fn get_target(
         return format!("/?r={}", base64url_no_pad(&packet));
     }
     let encoded = base64url_no_pad(payload);
-    // TODO(remove-legacy-m5oh-route): this visible `m5` selector is retained
-    // only for older endpoints and clients.
-    match (route, payload.is_empty()) {
-        (Some(route), true) => format!("/?m5={route}"),
-        (Some(route), false) => format!("/?m5={route}&r={encoded}"),
-        (None, true) => "/".to_string(),
-        (None, false) => format!("/?r={encoded}"),
+    if payload.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?r={encoded}")
     }
 }
 
@@ -512,12 +494,9 @@ mod tests {
     use super::get_target;
 
     #[test]
-    fn legacy_route_selector_remains_compatible() {
-        assert_eq!(get_target(Some("main"), None, &[]), "/?m5=main");
-        assert_eq!(
-            get_target(Some("file-main"), None, &[0, 1, 2]),
-            "/?m5=file-main&r=AAEC"
-        );
+    fn human_readable_route_selector_is_not_emitted() {
+        assert_eq!(get_target(Some("main"), None, &[]), "/");
+        assert_eq!(get_target(Some("file-main"), None, &[0, 1, 2]), "/?r=AAEC");
         assert_eq!(get_target(None, None, &[0, 1]), "/?r=AAE");
     }
 

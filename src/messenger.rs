@@ -57,10 +57,7 @@ pub fn select_endpoint(configured: &str, mode: TransportMode) -> io::Result<Stri
 
     let is_m5oh = |value: &&str| {
         let lower = value.to_ascii_lowercase();
-        lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("m5oh://")
-            || lower.starts_with("m5ohs://")
+        lower.starts_with("http://") || lower.starts_with("https://")
     };
     let selected: Vec<&str> = match mode {
         TransportMode::Auto => candidates
