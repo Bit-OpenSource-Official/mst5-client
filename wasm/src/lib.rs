@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Read;
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
@@ -355,6 +356,12 @@ struct E2eEnvelopeJson {
 }
 
 #[derive(Serialize, Deserialize)]
+struct GroupE2eEnvelopeJson {
+    version: u8,
+    recipients: HashMap<String, E2eEnvelopeJson>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct E2eBackupJson {
     version: u8,
     salt: String,
@@ -426,6 +433,30 @@ impl Mst5E2eIdentity {
         let result = Uint8Array::from(plaintext.as_slice());
         plaintext.zeroize();
         Ok(result)
+    }
+
+    #[wasm_bindgen(js_name = sealGroupMessage)]
+    pub fn seal_group_message(&self, peer_keys: JsValue, from: String, plaintext: Uint8Array) -> Result<JsValue, JsValue> {
+        let keys: HashMap<String, String> = serde_wasm_bindgen::from_value(peer_keys)
+            .map_err(|_| JsValue::from_str("invalid group E2E recipient keys"))?;
+        let recipients = keys.into_iter().map(|(id, key)| parse_e2e_public(&key).map(|key| (id, key))).collect::<Result<Vec<_>, _>>()?;
+        let mut bytes = vec![0; plaintext.length() as usize];
+        plaintext.copy_to(&mut bytes);
+        let group = self.identity()?.seal_group(&recipients, &from, &bytes).map_err(e2e_error)?;
+        bytes.zeroize();
+        let recipients = group.recipients.into_iter().map(|(id, envelope)| (id, E2eEnvelopeJson { version: envelope.version, nonce: STANDARD.encode(envelope.nonce), ciphertext: STANDARD.encode(envelope.ciphertext) })).collect();
+        GroupE2eEnvelopeJson { version: group.version, recipients }
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|_| JsValue::from_str("cannot encode group E2E envelope"))
+    }
+
+    #[wasm_bindgen(js_name = openGroupMessage)]
+    pub fn open_group_message(&self, sender_public_key: String, sender: String, recipient: String, envelope: JsValue) -> Result<Uint8Array, JsValue> {
+        let raw: GroupE2eEnvelopeJson = serde_wasm_bindgen::from_value(envelope).map_err(|_| JsValue::from_str("invalid group E2E envelope"))?;
+        let recipients = raw.recipients.into_iter().map(|(id, value)| { let nonce: [u8; 24] = decode_e2e(&value.nonce, "nonce", Some(24))?.try_into().map_err(|_| JsValue::from_str("invalid group E2E nonce"))?; Ok((id, e2e::Envelope { version: value.version, nonce, ciphertext: decode_e2e(&value.ciphertext, "ciphertext", None)? })) }).collect::<Result<HashMap<_, _>, JsValue>>()?;
+        let group = e2e::GroupEnvelope { version: raw.version, recipients };
+        let opened = self.identity()?.open_group(parse_e2e_public(&sender_public_key)?, &sender, &recipient, &group).map_err(e2e_error)?;
+        Ok(Uint8Array::from(opened.as_slice()))
     }
 
     #[wasm_bindgen(js_name = createBackup)]

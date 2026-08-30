@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -46,6 +47,15 @@ pub struct Envelope {
     pub version: u8,
     pub nonce: [u8; 24],
     pub ciphertext: Vec<u8>,
+}
+
+/// A group message carries one ordinary E2E envelope per recipient. The
+/// ciphertext is never shared between recipients, so removing a member does
+/// not grant access to messages sent after their removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupEnvelope {
+    pub version: u8,
+    pub recipients: HashMap<String, Envelope>,
 }
 
 /// Versioned, streamable encrypted-media container.  It is intentionally
@@ -206,6 +216,45 @@ impl Identity {
             return Ok(plaintext);
         }
         decode_message_v4(&plaintext)
+    }
+
+    pub fn seal_group(
+        &self,
+        recipients: &[(String, [u8; 32])],
+        from_id: &str,
+        plaintext: &[u8],
+    ) -> io::Result<GroupEnvelope> {
+        if recipients.is_empty() || recipients.len() > 256 {
+            return Err(invalid("group E2E recipients must be 1..256"));
+        }
+        let mut envelopes = HashMap::with_capacity(recipients.len());
+        for (recipient_id, public_key) in recipients {
+            if recipient_id.is_empty() || recipient_id.len() > 64 {
+                return Err(invalid("invalid group E2E recipient"));
+            }
+            envelopes.insert(
+                recipient_id.clone(),
+                self.seal(*public_key, from_id, recipient_id, plaintext)?,
+            );
+        }
+        Ok(GroupEnvelope { version: 5, recipients: envelopes })
+    }
+
+    pub fn open_group(
+        &self,
+        sender_public: [u8; 32],
+        sender_id: &str,
+        recipient_id: &str,
+        envelope: &GroupEnvelope,
+    ) -> io::Result<Vec<u8>> {
+        if envelope.version != 5 {
+            return Err(invalid("unsupported group E2E envelope"));
+        }
+        let selected = envelope
+            .recipients
+            .get(recipient_id)
+            .ok_or_else(|| invalid("group E2E recipient is not present"))?;
+        self.open(sender_public, sender_id, recipient_id, selected)
     }
 
     #[cfg(test)]
@@ -880,6 +929,29 @@ mod tests {
         let mut envelope = alice.seal(bob.public_key(), "13", "14", b"text").unwrap();
         envelope.ciphertext[0] ^= 1;
         assert!(bob.open(alice.public_key(), "13", "14", &envelope).is_err());
+    }
+
+    #[test]
+    fn group_envelope_seals_and_opens_per_recipient() {
+        let alice = Identity::from_private([21; 32]);
+        let bob = Identity::from_private([22; 32]);
+        let carol = Identity::from_private([23; 32]);
+        let recipients = vec![
+            ("22".to_string(), bob.public_key()),
+            ("23".to_string(), carol.public_key()),
+        ];
+        let group = alice.seal_group(&recipients, "21", b"group secret").unwrap();
+        assert_eq!(group.version, 5);
+        assert_eq!(group.recipients.len(), 2);
+        assert_eq!(
+            bob.open_group(alice.public_key(), "21", "22", &group).unwrap(),
+            b"group secret"
+        );
+        assert_eq!(
+            carol.open_group(alice.public_key(), "21", "23", &group).unwrap(),
+            b"group secret"
+        );
+        assert!(bob.open_group(alice.public_key(), "21", "24", &group).is_err());
     }
 
     #[test]
