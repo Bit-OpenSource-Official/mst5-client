@@ -420,9 +420,16 @@ client.read_messages("@alice").await?;
 | `reset_cloud_password(email, code).await` | Public / Both | `Value` | Reset/recover cloud password. |
 | `set_e2e_key(public_key_b64).await` | Both | `Value` | Register current account E2E public key. |
 | `get_e2e_key(user).await` | Both | `Value` | Read another account's E2E public key. |
+| `set_chat_e2e_key(chat_id, public_key_b64).await` | Both | `Value` | Register a chat-scoped public key. |
+| `get_chat_e2e_key(user, chat_id).await` | Both | `Value` | Read a member's key for a specific chat. |
 | `set_e2e_backup(backup).await` | Both | `Value` | Store E2E backup data. |
 | `get_e2e_backup().await` | Both | `Value` | Read current account E2E backup. |
 | `reset_e2e().await` | Both | `Value` | Reset current account E2E state. |
+
+Group message envelopes use version 5 and contain one independently encrypted
+envelope per recipient. Native callers can use `Identity::seal_group` and
+`Identity::open_group`; the WASM binding exposes `sealGroupMessage` and
+`openGroupMessage`.
 
 ## Wallet and reactions
 
