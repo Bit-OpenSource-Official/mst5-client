@@ -470,6 +470,14 @@ impl Mst5E2eIdentity {
         e2e::encrypted_media_size(plaintext_size).map_err(e2e_error)
     }
 
+    /// Derives a media-stream key that applications may wrap for multiple
+    /// recipients before uploading a single ciphertext stream.
+    #[wasm_bindgen(js_name = mediaKey)]
+    pub fn media_key(&self, peer_public_key: String, from: String, to: String) -> Result<String, JsValue> {
+        let key = self.identity()?.media_key(parse_e2e_public(&peer_public_key)?, &from, &to).map_err(e2e_error)?;
+        Ok(STANDARD.encode(key))
+    }
+
     pub fn close(&self) { self.inner.borrow_mut().take(); }
 }
 

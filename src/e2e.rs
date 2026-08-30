@@ -300,7 +300,7 @@ impl Identity {
     ) -> io::Result<MediaEncryptor> {
         let key =
             self.session_key_with_label(peer_public, from_id, to_id, b"media-stream-v2-key")?;
-        MediaEncryptor::new(
+        MediaEncryptor::with_key(
             key.as_slice(),
             media_aad(from_id, to_id, file_id),
             plaintext_size,
@@ -318,7 +318,14 @@ impl Identity {
     ) -> io::Result<MediaDecryptor> {
         let key =
             self.session_key_with_label(peer_public, from_id, to_id, b"media-stream-v2-key")?;
-        MediaDecryptor::new(key.as_slice(), media_aad(from_id, to_id, file_id))
+        MediaDecryptor::with_key(key.as_slice(), media_aad(from_id, to_id, file_id))
+    }
+
+    /// Derives the media stream key so a caller can wrap it for multiple
+    /// group recipients while encrypting the bytes only once.
+    pub fn media_key(&self, peer_public: [u8; 32], from_id: &str, to_id: &str) -> io::Result<[u8; 32]> {
+        let key = self.session_key_with_label(peer_public, from_id, to_id, b"media-stream-v2-key")?;
+        Ok(*key)
     }
 
     pub fn backup(&self, password: &str) -> io::Result<Backup> {
@@ -458,6 +465,10 @@ impl MediaEncryptor {
         })
     }
 
+    pub fn with_key(key: &[u8], aad_prefix: Vec<u8>, plaintext_size: u64) -> io::Result<Self> {
+        Self::new(key, aad_prefix, plaintext_size)
+    }
+
     pub fn header(&self) -> [u8; MEDIA_HEADER_SIZE] {
         let mut header = [0u8; MEDIA_HEADER_SIZE];
         header[..4].copy_from_slice(MEDIA_MAGIC);
@@ -532,6 +543,10 @@ impl MediaDecryptor {
             pending: Vec::with_capacity(MEDIA_CHUNK_SIZE + 4 + MEDIA_TAG_SIZE),
             header_read: false,
         })
+    }
+
+    pub fn with_key(key: &[u8], aad_prefix: Vec<u8>) -> io::Result<Self> {
+        Self::new(key, aad_prefix)
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> io::Result<Vec<Vec<u8>>> {
@@ -952,6 +967,23 @@ mod tests {
             b"group secret"
         );
         assert!(bob.open_group(alice.public_key(), "21", "24", &group).is_err());
+    }
+
+    #[test]
+    fn media_key_can_be_reused_for_group_wrapping() {
+        let alice = Identity::from_private([31; 32]);
+        let bob = Identity::from_private([32; 32]);
+        let key = alice.media_key(bob.public_key(), "31", "32").unwrap();
+        let bytes = b"group media";
+        let mut enc = MediaEncryptor::with_key(&key, media_aad("31", "32", "f"), bytes.len() as u64).unwrap();
+        let mut wire = enc.header().to_vec();
+        wire.extend(enc.seal_chunk(bytes).unwrap());
+        enc.finish().unwrap();
+        let mut dec = MediaDecryptor::with_key(&key, media_aad("31", "32", "f")).unwrap();
+        let mut opened = Vec::new();
+        for chunk in wire.chunks(7) { opened.extend(dec.push(chunk).unwrap().into_iter().flatten()); }
+        dec.finish().unwrap();
+        assert_eq!(opened, bytes);
     }
 
     #[test]
