@@ -286,13 +286,16 @@ jobs:
         with:
           name: native-wasm
           path: release
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          VERSION: ${{ needs.version.outputs.value }}
-        run: |
-          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "v$VERSION" --target "$GITHUB_SHA" --title "mst5-client $VERSION" --notes "WASM browser build"
-          gh release upload "v$VERSION" release/* --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Publish WASM release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.value }}
+          name: mst5-client ${{ needs.version.outputs.value }}
+          body: WASM browser build
+          files: release/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   publish:
     needs: [version, linux, windows, apple, apple-bundles, android]
