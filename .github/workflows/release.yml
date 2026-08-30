@@ -276,8 +276,26 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
 
+  # Browser releases are consumed by the web client and must not wait for
+  # unrelated native architecture matrices.
+  publish-wasm:
+    needs: [version, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-wasm
+          path: release
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.value }}
+        run: |
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "v$VERSION" --target "$GITHUB_SHA" --title "mst5-client $VERSION" --notes "WASM browser build"
+          gh release upload "v$VERSION" release/* --clobber --repo "$GITHUB_REPOSITORY"
+
   publish:
-    needs: [version, linux, windows, apple, apple-bundles, android, wasm]
+    needs: [version, linux, windows, apple, apple-bundles, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
