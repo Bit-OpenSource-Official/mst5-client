@@ -381,6 +381,8 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("POST", "/edit") => op::EDIT,
         ("POST", "/pin") => op::PIN,
         ("POST", "/polls/vote") => op::POLL_VOTE,
+        ("GET", "/chats/favorites") => op::CHAT_FAVORITES,
+        ("POST", "/chats/favorite") => op::CHAT_FAVORITE,
         ("POST", "/callback") => op::CALLBACK,
         ("POST", "/reactions") => op::REACT,
         ("POST", "/reactions/paid") => op::REACT_PAID,

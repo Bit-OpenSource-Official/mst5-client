@@ -232,6 +232,8 @@ pub mod op {
     pub const ACCOUNT_INACTIVITY_SET: u16 = 91;
     pub const PIN: u16 = 92;
     pub const POLL_VOTE: u16 = 93;
+    pub const CHAT_FAVORITES: u16 = 94;
+    pub const CHAT_FAVORITE: u16 = 95;
 }
 
 #[derive(Clone, Debug, PartialEq)]
