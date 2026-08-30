@@ -230,6 +230,7 @@ pub mod op {
     pub const AVATAR_DELETE: u16 = 88;
     pub const ACCOUNT_INACTIVITY_GET: u16 = 90;
     pub const ACCOUNT_INACTIVITY_SET: u16 = 91;
+    pub const PIN: u16 = 92;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -694,6 +695,7 @@ pub struct Message {
     pub reply_to_message_id: Option<i64>,
     pub client_message_id: Option<String>,
     pub edited_at: Option<i64>,
+    pub pinned_at: Option<i64>,
     pub read_at: Option<i64>,
     pub media: Vec<Value>,
     pub system: bool,
@@ -716,6 +718,7 @@ impl Message {
             reply_to_message_id: optional_i64(value, "reply_to_message_id")?,
             client_message_id: optional_string(value, "client_message_id")?,
             edited_at: optional_i64(value, "edited_at")?,
+            pinned_at: optional_i64(value, "pinned_at")?,
             read_at: optional_i64(value, "read_at")?,
             media: optional_array(value, "media")?.unwrap_or_default(),
             system: optional_bool(value, "system")?.unwrap_or(false),
@@ -2388,6 +2391,13 @@ impl Client {
     pub async fn edit_message_advanced(&self, request: Value) -> io::Result<Message> {
         let value = self.command_result(op::EDIT, request).await?;
         message_from_result(&value, "edit_message response")
+    }
+
+    pub async fn pin_message(&self, id: i64, pinned: bool) -> io::Result<Message> {
+        let value = self.command_result(op::PIN, Value::map([
+            ("id", Value::Integer(id)), ("pinned", Value::Bool(pinned)),
+        ])).await?;
+        message_from_result(&value, "pin_message response")
     }
 
     pub async fn callback<T: ToString>(

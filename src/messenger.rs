@@ -379,6 +379,7 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("GET", "/voice/participants") => op::VOICE_PARTICIPANTS,
         ("POST", "/send") => op::SEND,
         ("POST", "/edit") => op::EDIT,
+        ("POST", "/pin") => op::PIN,
         ("POST", "/callback") => op::CALLBACK,
         ("POST", "/reactions") => op::REACT,
         ("POST", "/reactions/paid") => op::REACT_PAID,
