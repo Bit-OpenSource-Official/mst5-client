@@ -260,6 +260,8 @@ mod tests {
             (("POST", "/polls/vote"), 93),
             (("GET", "/chats/favorites"), 94),
             (("POST", "/chats/favorite"), 95),
+            (("GET", "/chats/folders"), 96),
+            (("POST", "/chats/folder"), 97),
         ] {
             assert_eq!(
                 operation(method, path).expect("registered operation"),
@@ -1931,6 +1933,8 @@ fn operation(method: &str, path: &str) -> Result<u16, JsValue> {
         ("POST", "/polls/vote") => 93,
         ("GET", "/chats/favorites") => 94,
         ("POST", "/chats/favorite") => 95,
+        ("GET", "/chats/folders") => 96,
+        ("POST", "/chats/folder") => 97,
         ("POST", "/avatars/prepare") => 86,
         ("POST", "/avatars/commit") => 87,
         ("POST", "/avatars/delete") => 88,

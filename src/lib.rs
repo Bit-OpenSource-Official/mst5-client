@@ -234,6 +234,8 @@ pub mod op {
     pub const POLL_VOTE: u16 = 93;
     pub const CHAT_FAVORITES: u16 = 94;
     pub const CHAT_FAVORITE: u16 = 95;
+    pub const CHAT_FOLDERS: u16 = 96;
+    pub const CHAT_FOLDER: u16 = 97;
 }
 
 #[derive(Clone, Debug, PartialEq)]
