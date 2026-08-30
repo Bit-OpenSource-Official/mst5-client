@@ -319,6 +319,7 @@ struct BrowserMediaUpload {
     sent: usize,
     chunk_size: usize,
     digest: Sha256,
+    resume_checksum: Option<String>,
 }
 
 /// A single ticket-authorized, encrypted media upload. JavaScript feeds it
@@ -678,6 +679,34 @@ impl Mst5Web {
         Ok(Mst5MediaUpload {
             inner: RefCell::new(Some(upload)),
         })
+    }
+
+    /// Resumes a previously interrupted upload. The caller must pass a
+    /// `File.slice(offset)` stream and the SHA-256 of the complete file.
+    #[wasm_bindgen]
+    pub async fn begin_resumable_media_upload(
+        &self,
+        m5ohs_endpoint: String,
+        media_endpoint: String,
+        ticket: String,
+        file_id: String,
+        expected_size: u64,
+        offset: u64,
+        sha256: String,
+    ) -> Result<Mst5MediaUpload, JsValue> {
+        if ticket.is_empty() || file_id.is_empty() || expected_size == 0 || offset > expected_size {
+            return Err(JsValue::from_str("invalid resumable media upload arguments"));
+        }
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(JsValue::from_str("invalid media checksum"));
+        }
+        let expected_size = usize::try_from(expected_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
+        let offset = usize::try_from(offset).map_err(|_| JsValue::from_str("media offset is too large for this browser"))?;
+        let destination = parse_media_destination(&media_endpoint)?;
+        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        media_authenticate(&mut session, ticket).await?;
+        let upload = BrowserMediaUpload::open_with_offset(session, file_id, expected_size, offset, Some(sha256)).await?;
+        Ok(Mst5MediaUpload { inner: RefCell::new(Some(upload)) })
     }
 
     /// Opens a media stream that encrypts each attachment chunk with the
@@ -1103,9 +1132,23 @@ impl BrowserMediaUpload {
         file_id: String,
         expected_size: usize,
     ) -> Result<Self, JsValue> {
+        Self::open_with_offset(session, file_id, expected_size, 0, None).await
+    }
+
+    async fn open_with_offset(
+        mut session: BrowserSession,
+        file_id: String,
+        expected_size: usize,
+        offset: usize,
+        checksum: Option<String>,
+    ) -> Result<Self, JsValue> {
+        if offset > expected_size {
+            return Err(JsValue::from_str("media upload offset exceeds size"));
+        }
         let id = session.take_request_id()?;
-        let payload =
-            serde_cbor::to_vec(&serde_json::json!({"file_id": file_id, "size": expected_size}))
+        let mut open = serde_json::json!({"file_id": file_id, "size": expected_size, "offset": offset});
+        if let Some(checksum) = checksum.as_deref() { open["sha256"] = JsonValue::String(checksum.to_owned()); }
+        let payload = serde_cbor::to_vec(&open)
                 .map_err(|_| JsValue::from_str("cannot encode media stream open"))?;
         session
             .write_frame(MST5_KIND_STREAM_OPEN, MEDIA_OP_UPLOAD, id, &payload)
@@ -1116,6 +1159,8 @@ impl BrowserMediaUpload {
         }
         let details: JsonValue = serde_cbor::from_slice(&accepted.payload)
             .map_err(|_| JsValue::from_str("invalid media upload acknowledgement"))?;
+        let accepted_offset = details.get("offset").and_then(JsonValue::as_u64).unwrap_or(offset as u64);
+        if accepted_offset != offset as u64 { return Err(JsValue::from_str("media node checkpoint mismatch")); }
         let server_chunk = details
             .get("chunk_size")
             .and_then(JsonValue::as_u64)
@@ -1126,9 +1171,10 @@ impl BrowserMediaUpload {
             session,
             id,
             expected_size,
-            sent: 0,
+            sent: offset,
             chunk_size: BROWSER_MEDIA_CHUNK.min(server_chunk),
             digest: Sha256::new(),
+            resume_checksum: checksum,
         })
     }
 
@@ -1152,7 +1198,7 @@ impl BrowserMediaUpload {
                 "media source ended before its declared size",
             ));
         }
-        let checksum = hex_bytes(&self.digest.clone().finalize());
+        let checksum = self.resume_checksum.clone().unwrap_or_else(|| hex_bytes(&self.digest.clone().finalize()));
         let end = serde_cbor::to_vec(&serde_json::json!({"size": self.sent, "sha256": checksum}))
             .map_err(|_| JsValue::from_str("cannot encode media stream end"))?;
         self.session

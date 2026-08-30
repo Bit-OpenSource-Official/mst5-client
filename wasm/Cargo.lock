@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-client-wasm"
-version = "0.7.26"
+version = "0.7.27"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "mst5-e2e-core"
-version = "0.7.26"
+version = "0.7.27"
 dependencies = [
  "argon2",
  "chacha20poly1305",
