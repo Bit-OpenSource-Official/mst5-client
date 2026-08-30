@@ -335,6 +335,8 @@ fn operation(method: &str, path: &str) -> io::Result<u16> {
         ("POST", "/auth/email/verify") => op::EMAIL_AUTH_VERIFY,
         ("GET", "/me") => op::ME,
         ("POST", "/account/delete") => op::ACCOUNT_DELETE,
+        ("GET", "/account/inactivity") => op::ACCOUNT_INACTIVITY_GET,
+        ("POST", "/account/inactivity") => op::ACCOUNT_INACTIVITY_SET,
         ("POST", "/username") => op::SET_USERNAME,
         ("POST", "/name") => op::SET_NAME,
         ("POST", "/privacy") => op::SET_PRIVACY,

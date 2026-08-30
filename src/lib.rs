@@ -228,6 +228,8 @@ pub mod op {
     pub const AVATAR_PREPARE: u16 = 86;
     pub const AVATAR_COMMIT: u16 = 87;
     pub const AVATAR_DELETE: u16 = 88;
+    pub const ACCOUNT_INACTIVITY_GET: u16 = 90;
+    pub const ACCOUNT_INACTIVITY_SET: u16 = 91;
 }
 
 #[derive(Clone, Debug, PartialEq)]
