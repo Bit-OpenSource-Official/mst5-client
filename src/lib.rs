@@ -236,6 +236,9 @@ pub mod op {
     pub const CHAT_FAVORITE: u16 = 95;
     pub const CHAT_FOLDERS: u16 = 96;
     pub const CHAT_FOLDER: u16 = 97;
+    pub const QR_LOGIN_START: u16 = 98;
+    pub const QR_LOGIN_POLL: u16 = 99;
+    pub const QR_LOGIN_APPROVE: u16 = 100;
 }
 
 #[derive(Clone, Debug, PartialEq)]
