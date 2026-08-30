@@ -2354,9 +2354,39 @@ impl Client {
         .await
     }
 
+    /// Registers a public E2E key scoped to a group/channel. The server keeps
+    /// this alongside the account key while preserving the legacy method
+    /// above for direct-message clients.
+    pub async fn set_chat_e2e_key(
+        &self,
+        chat_id: &str,
+        public_key_b64: &str,
+    ) -> io::Result<Value> {
+        self.command_result(
+            op::SET_E2E_KEY,
+            Value::map([
+                ("version", Value::from(3_i64)),
+                ("public_key", Value::from(public_key_b64)),
+                ("chat_id", Value::from(chat_id)),
+            ]),
+        )
+        .await
+    }
+
     pub async fn get_e2e_key<T: ToString>(&self, user: T) -> io::Result<Value> {
         let mut query = QueryBuilder::new();
         query.push("user", &user.to_string());
+        self.query_result(op::GET_E2E_KEY, &query.finish()).await
+    }
+
+    pub async fn get_chat_e2e_key<T: ToString>(
+        &self,
+        user: T,
+        chat_id: &str,
+    ) -> io::Result<Value> {
+        let mut query = QueryBuilder::new();
+        query.push("user", &user.to_string());
+        query.push("chat_id", chat_id);
         self.query_result(op::GET_E2E_KEY, &query.finish()).await
     }
 
