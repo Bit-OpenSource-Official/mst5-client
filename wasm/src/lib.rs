@@ -34,7 +34,14 @@ const HEADER_CHANNEL: &str = "X-MST5-Channel";
 const HEADER_SEQUENCE: &str = "X-MST5-Seq";
 const HEADER_EOF: &str = "X-MST5-EOF";
 const HEADER_STATUS: &str = "X-MST5-Status";
-const MAX_GET_BYTES: usize = 23 * 1024 - 8;
+// The CDN caps the complete request target at 23 KiB, not the raw bytes that
+// are placed into `r`.  The payload is Base64URL-encoded and every routed
+// packet carries an additional opaque eight-byte destination selector.
+const MAX_GET_TARGET: usize = 23 * 1024;
+const GET_TARGET_PREFIX: usize = 4; // `/?r=`
+const PACKET_ROUTE_BYTES: usize = 8;
+const MAX_GET_RECORD_BYTES: usize = ((MAX_GET_TARGET - GET_TARGET_PREFIX) / 4) * 3
+    - PACKET_ROUTE_BYTES;
 const CLIENT_MAGIC: &[u8; 4] = b"RCP5";
 const SERVER_MAGIC: &[u8; 4] = b"RSP5";
 const TAG_LEN: usize = 16;
@@ -161,7 +168,7 @@ impl M5ohFetch {
     ) -> Result<Uint8Array, JsValue> {
         let mut bytes = vec![0; record.length() as usize];
         record.copy_to(&mut bytes);
-        if bytes.len() > MAX_GET_BYTES {
+        if bytes.len() > MAX_GET_RECORD_BYTES {
             return Err(JsValue::from_str(
                 "M5oH encrypted GET record exceeds CDN limit",
             ));
@@ -213,6 +220,15 @@ mod tests {
         assert!(id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+
+    #[test]
+    fn routed_get_record_fits_the_cdn_request_target() {
+        let packet = vec![0x5a; PACKET_ROUTE_BYTES + MAX_GET_RECORD_BYTES];
+        assert_eq!(GET_TARGET_PREFIX + URL_SAFE_NO_PAD.encode(packet).len(), MAX_GET_TARGET);
+
+        let oversized = vec![0x5a; PACKET_ROUTE_BYTES + MAX_GET_RECORD_BYTES + 1];
+        assert!(GET_TARGET_PREFIX + URL_SAFE_NO_PAD.encode(oversized).len() > MAX_GET_TARGET);
     }
 
     #[test]
@@ -666,6 +682,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         data: Uint8Array,
@@ -675,15 +692,9 @@ impl Mst5Web {
                 "media ticket, file id and data are required",
             ));
         }
-        let destination = parse_media_destination(&media_endpoint)?;
         let mut bytes = vec![0; data.length() as usize];
         data.copy_to(&mut bytes);
-        let mut session = establish_session_with_features(
-            m5ohs_endpoint,
-            destination,
-            REQUIRED_MEDIA_FEATURES,
-        )
-        .await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         session.upload_media(&file_id, &bytes).await
     }
@@ -695,6 +706,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -706,13 +718,7 @@ impl Mst5Web {
         }
         let expected_size = usize::try_from(expected_size)
             .map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(
-            m5ohs_endpoint,
-            destination,
-            REQUIRED_MEDIA_FEATURES,
-        )
-        .await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
         Ok(Mst5MediaUpload {
@@ -727,6 +733,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -741,8 +748,7 @@ impl Mst5Web {
         }
         let expected_size = usize::try_from(expected_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
         let offset = usize::try_from(offset).map_err(|_| JsValue::from_str("media offset is too large for this browser"))?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let upload = BrowserMediaUpload::open_with_offset(session, file_id, expected_size, offset, Some(sha256)).await?;
         Ok(Mst5MediaUpload { inner: RefCell::new(Some(upload)) })
@@ -756,6 +762,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         plaintext_size: u64,
@@ -777,13 +784,7 @@ impl Mst5Web {
             .identity()?
             .media_encryptor(peer, &from, &to, &file_id, plaintext_size)
             .map_err(e2e_error)?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(
-            m5ohs_endpoint,
-            destination,
-            REQUIRED_MEDIA_FEATURES,
-        )
-        .await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let mut upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
         upload.write(&encryptor.header()).await?;
@@ -801,7 +802,7 @@ impl Mst5Web {
     /// is wrapped in the per-recipient group envelope.
     #[wasm_bindgen(js_name = beginE2eMediaUploadWithKey)]
     pub async fn begin_e2e_media_upload_with_key(
-        &self, m5ohs_endpoint: String, media_endpoint: String, ticket: String,
+        &self, m5ohs_endpoint: String, media_endpoint: String, media_public_key: String, ticket: String,
         file_id: String, plaintext_size: u64, media_key: String, file_aad: String,
     ) -> Result<Mst5E2eMediaUpload, JsValue> {
         if ticket.is_empty() || file_id.is_empty() || plaintext_size == 0 {
@@ -812,8 +813,7 @@ impl Mst5Web {
         let expected_size = usize::try_from(encrypted_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
         let aad = STANDARD.decode(file_aad).map_err(|_| JsValue::from_str("invalid media AAD"))?;
         let encryptor = e2e::MediaEncryptor::with_key(&key, aad, plaintext_size).map_err(e2e_error)?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let mut upload = BrowserMediaUpload::open(session, file_id, expected_size).await?;
         upload.write(&encryptor.header()).await?;
@@ -828,6 +828,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -844,13 +845,7 @@ impl Mst5Web {
                 "media file exceeds the browser download memory limit",
             ));
         }
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(
-            m5ohs_endpoint,
-            destination,
-            REQUIRED_MEDIA_FEATURES,
-        )
-        .await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let bytes = session.download_media(&file_id, expected_size).await?;
         Ok(Uint8Array::from(bytes.as_slice()))
@@ -864,6 +859,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -874,8 +870,7 @@ impl Mst5Web {
         }
         let expected_size = usize::try_from(expected_size).map_err(|_| JsValue::from_str("media file is too large for this browser"))?;
         if expected_size > MAX_BROWSER_DOWNLOAD_BYTES { return Err(JsValue::from_str("media file exceeds the browser download memory limit")); }
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         session.download_media_stream(&file_id, expected_size, &on_chunk).await
     }
@@ -888,6 +883,7 @@ impl Mst5Web {
         &self,
         m5ohs_endpoint: String,
         media_endpoint: String,
+        media_public_key: String,
         ticket: String,
         file_id: String,
         expected_size: u64,
@@ -913,13 +909,7 @@ impl Mst5Web {
             .identity()?
             .media_decryptor(peer, &from, &to, &file_id)
             .map_err(e2e_error)?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(
-            m5ohs_endpoint,
-            destination,
-            REQUIRED_MEDIA_FEATURES,
-        )
-        .await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let mut plaintext = session
             .download_e2e_media(&file_id, expected_size, decryptor)
@@ -931,7 +921,7 @@ impl Mst5Web {
 
     #[wasm_bindgen(js_name = downloadE2eMediaWithKey)]
     pub async fn download_e2e_media_with_key(
-        &self, m5ohs_endpoint: String, media_endpoint: String, ticket: String,
+        &self, m5ohs_endpoint: String, media_endpoint: String, media_public_key: String, ticket: String,
         file_id: String, expected_size: u64, media_key: String, file_aad: String,
     ) -> Result<Uint8Array, JsValue> {
         if ticket.is_empty() || file_id.is_empty() || expected_size == 0 { return Err(JsValue::from_str("media ticket, file id and expected size are required")); }
@@ -940,8 +930,7 @@ impl Mst5Web {
         let key = decode_e2e(&media_key, "media key", Some(32))?;
         let aad = STANDARD.decode(file_aad).map_err(|_| JsValue::from_str("invalid media AAD"))?;
         let decryptor = e2e::MediaDecryptor::with_key(&key, aad).map_err(e2e_error)?;
-        let destination = parse_media_destination(&media_endpoint)?;
-        let mut session = establish_session_with_features(m5ohs_endpoint, destination, REQUIRED_MEDIA_FEATURES).await?;
+        let mut session = establish_media_session(m5ohs_endpoint, media_endpoint, media_public_key).await?;
         media_authenticate(&mut session, ticket).await?;
         let mut plaintext = session.download_e2e_media(&file_id, expected_size, decryptor).await?;
         let result = Uint8Array::from(plaintext.as_slice());
@@ -1118,9 +1107,31 @@ async fn establish_session_with_features(
     destination: String,
     required_features: u64,
 ) -> Result<BrowserSession, JsValue> {
+    let key = decode_server_key(EMBEDDED_ACCOUNT_PUBLIC_KEY)?;
+    establish_session_with_key(endpoint, destination, key, required_features).await
+}
+
+/// Media nodes deliberately use an independent Noise/X25519 identity.  Their
+/// public key is delivered in a short-lived ticket over the already pinned
+/// messenger connection; never replace it with the account-server pin.
+async fn establish_media_session(
+    endpoint: String,
+    media_endpoint: String,
+    media_public_key: String,
+) -> Result<BrowserSession, JsValue> {
+    let destination = parse_media_destination(&media_endpoint)?;
+    let key = decode_server_key(&media_public_key)?;
+    establish_session_with_key(endpoint, destination, key, REQUIRED_MEDIA_FEATURES).await
+}
+
+async fn establish_session_with_key(
+    endpoint: String,
+    destination: String,
+    key: [u8; 32],
+    required_features: u64,
+) -> Result<BrowserSession, JsValue> {
     let (ip, port) = parse_destination(&destination)?;
     let route = encode_route(ip.to_string(), port, 0)?;
-    let key = decode_server_key(EMBEDDED_ACCOUNT_PUBLIC_KEY)?;
     let transport = M5ohFetch::new(endpoint, route)?;
     let tunnel_id = browser_tunnel_id()?;
     // seq=0 makes the router establish its upstream TCP connection before
@@ -1211,7 +1222,7 @@ async fn authenticate_session(
 
 impl BrowserMediaUpload {
     async fn open(
-        mut session: BrowserSession,
+        session: BrowserSession,
         file_id: String,
         expected_size: usize,
     ) -> Result<Self, JsValue> {
@@ -2149,7 +2160,7 @@ impl M5ohFetch {
         record: &[u8],
         eof: bool,
     ) -> Result<Vec<u8>, JsValue> {
-        if record.len() > MAX_GET_BYTES {
+        if record.len() > MAX_GET_RECORD_BYTES {
             return Err(JsValue::from_str(
                 "M5oH encrypted GET record exceeds CDN limit",
             ));

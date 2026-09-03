@@ -30,14 +30,21 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 
 const MAX_HTTP_HEAD: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 8 * 1024 * 1024;
-// The CDN budget is 23 KiB per GET payload. Packet-routed M5oH reserves the
-// first eight bytes for the opaque node port carried inside `r`.
-const UPLOAD_CHUNK: usize = 23 * 1024 - 8;
-const UPLOAD_COALESCE: Duration = Duration::from_millis(2);
+// The CDN limits the *complete GET target* to 23 KiB. `r` is Base64URL, so
+// treating 23 KiB as a raw payload limit would create a roughly 31 KiB URL
+// and make larger MST5 records (in particular media streams) fail only when
+// M5oH is selected.  Leave four bytes for `/?r=`, choose a whole Base64 group,
+// then reserve the eight opaque packet-routing bytes.
+const MAX_GET_TARGET: usize = 23 * 1024;
+const GET_TARGET_PREFIX: usize = 4; // `/?r=`
 const PACKET_ROUTE_DESTINATION_BYTES: usize = 8;
+const UPLOAD_CHUNK: usize =
+    ((MAX_GET_TARGET - GET_TARGET_PREFIX) / 4) * 3 - PACKET_ROUTE_DESTINATION_BYTES;
+const UPLOAD_COALESCE: Duration = Duration::from_millis(2);
 // The production edge currently uses the project CA below rather than a
 // browser CA. Keep public WebPKI roots as well so independently hosted M5oH
 // domains can use ordinary public certificates.
+#[cfg(feature = "m5oh-tls")]
 const OVE_PRODUCTION_CA_DER_B64: &str = "MIIFHzCCAwegAwIBAgIUfMPeVsx/AOHL2N4bA0mI2xeX8GMwDQYJKoZIhvcNAQELBQAwHzEdMBsGA1UEAwwUb3ZlLnJzIGxvY2FsIHRlc3QgQ0EwHhcNMjYwNzI5MTQxMjM4WhcNMzYwNzI2MTQxMjM4WjAfMR0wGwYDVQQDDBRvdmUucnMgbG9jYWwgdGVzdCBDQTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALszQFeOXjlEWtwC5whUpCRIptscRIYijvPvdObPygESuvVUYLKxRoirHgGrERb4oakXtAbk6ce/TA4tHPMTLM1H2IvRtCwp+/ZCOJgPMa4RQ9eRXhAMupDIzsWQUtVbxUrZstfwAJ+UoLlZTUurR0orXK/jQ2CppqKDMc4eVY+gaCiXg04j9U+9PdqX8Tv0ga/WaSlOHXVmuCI3t6Ja/p2tAfdM5PwXud0by1byXMvl1xW6OA3vl1XMUrmoCuJI9AD+7ufhlxnn8JfHi2Qzg1+xEZeOSjvB7qa6mxPbAWbFwXIPbQXFZUgc1aXbe+huaocivYzdCCZD+WbsnBEFynpylGySZian88gVmjVmKOYTv43IqHRKI/2KhXk37wTy73UETQ77SWIXDrKWmAkQafNq0H2O7UrIr5uUryckcTrW8BbY0Cfg9ofO8FGHQ4PxLXTrDwdzXqeZax/HN00qJvYthrogcZTsNZcqVGk3drrpWbJj9C/xWA5tnULEnIgCIUwGY8MdHX3EzejoYSIGKxxYCiEHchehuMmcdWeR9Y64r/yAN+Gu3T1/mQblcu2kr0cb1qFfmZYS44jwZq7tHQk1NaXijn1YXhf6zFc1mvbbotxHX9lfvAI+139hG8IjwnazSogNaXADPEDdyGxlY36pVslPUF/QZhOeIc80+v1/AgMBAAGjUzBRMB0GA1UdDgQWBBQgS5Qsi0OqXLTQ1BVoVqoaUSgZ/jAfBgNVHSMEGDAWgBQgS5Qsi0OqXLTQ1BVoVqoaUSgZ/jAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4ICAQAU1RnkWBGH5LOTqxk+m48O9myi0VkQvN1svdolBsaf8c1OqgbJ0MjCL2HNy7X+l+tx/lcRMfX/rDGE2kfy6R6hy5hzfi2uvBTD97JKeDw3ftZl4k7uTINBf9NdbA3jtH+NiuXfvU79lOHzsilNpa+K5MrMzOSw4yR+4INSApD/GAlWN4hkT4ZjdHRKjej4w9QAXGRC+UJSaRDEs5b+wKnoYKQNt0FUgVReVcaNSWC8TorVma5zbF8U0slF3lB57QeiythYiHATqJh/1zQhpKvko6bxqcEbDTFJNgz8DWzrVlRcJILjABHdVNjS938bnSBWTNTrckFKdNmyu5+WKhIevciDoGVl8oC+tkVtKPQnI7AtKUFIpVqi+DCBXmTrYwLBngNChKRxiyjDUnSbO0pbtvSwpc4rlP9VnBmJr+DOqdunSKo9xp4C+gVNbUXfCw6cdGmRz9YYNMo1PMOArmipy+PEn1N9EZAIoBWmXc+Whm+szVtWGWf4/eMiRs+rR52+sfJIYZ9A2DZ9rrmxffj6ysmcUNi9GQNV29IXmQI6a6lulhQWyR7DjpxoIKyeBXiLav20JxvJszD4zKuXnJVrdr7tr2ksw04yMV9KI2nAl+a0wVgIqYMz/jare6FeCPDCOqQe3sFbtZ9kDBXHA1AVeH0DhiI6wa13tKDjo69QjA==";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,7 +519,16 @@ mod tests {
     fn routed_get_target_fits_the_cdn_limit() {
         let destination = "10.100.2.228:8081".parse().unwrap();
         let target = get_target(None, Some(destination), &vec![0x5a; super::UPLOAD_CHUNK]);
-        assert_eq!(target.len(), 31_407);
+        assert_eq!(target.len(), 23 * 1024);
+        assert!(
+            get_target(
+                None,
+                Some(destination),
+                &vec![0x5a; super::UPLOAD_CHUNK + 1]
+            )
+            .len()
+                > 23 * 1024
+        );
     }
 }
 

@@ -100,11 +100,14 @@ fn java_string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, Strin
 }
 
 /// Release artifacts carry the account server pin compiled into
-/// `mst5-client`.  JNI keeps accepting the legacy Java argument so debug
+/// `mst5-client`. JNI keeps accepting the legacy Java argument so debug
 /// builds can still target a development server, but a configured compiled
-/// pin always wins.  This applies equally to the messenger, media and voice
-/// paths and prevents the Java layer from accidentally using a different
-/// server identity.
+/// pin always wins for an account connection.
+///
+/// Do not use this for media or voice streams. Their tickets are issued by
+/// the pinned account server and deliberately name a *different* node with
+/// its own X25519 key. Replacing that node key with the account pin makes the
+/// Noise handshake fail after the client has already read the entire upload.
 fn configured_server_public_key(supplied: String) -> String {
     compiled_server_public_key_b64()
         .map(str::to_owned)
@@ -793,7 +796,10 @@ fn transfer_strings(
 ) -> Result<(String, String, String, String), String> {
     Ok((
         java_string(env, endpoint)?,
-        configured_server_public_key(java_string(env, public_key)?),
+        // `public_key` belongs to the ticket-selected media node. It is
+        // authenticated by the ticket issuer; it must not be replaced with
+        // the compiled account-server pin.
+        java_string(env, public_key)?,
         java_string(env, ticket)?,
         java_string(env, file_id)?,
     ))
@@ -1024,11 +1030,10 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeUploadBatch(
         {
             return Err("media batch arrays must have the same 1..64 length".to_string());
         }
-        let public_keys = if let Ok(key) = compiled_server_public_key_b64() {
-            vec![key.to_owned(); count]
-        } else {
-            supplied_public_keys
-        };
+        // Every batch item can target a different media node. Keep the
+        // server-provided key paired with its endpoint rather than applying
+        // the account-server pin to every item.
+        let public_keys = supplied_public_keys;
         let mut sizes_raw = vec![0_i64; count];
         let mut fds_raw = vec![0_i32; count];
         env.get_long_array_region(&sizes, 0, &mut sizes_raw)
@@ -1465,7 +1470,9 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeVoiceOpen(
 ) -> jlong {
     let result = (|| -> Result<i64, String> {
         let endpoint = java_string(&mut env, endpoint)?;
-        let public_key = configured_server_public_key(java_string(&mut env, public_key)?);
+        // Voice tickets, like media tickets, select a dedicated node with a
+        // dedicated public key.
+        let public_key = java_string(&mut env, public_key)?;
         let ticket = java_string(&mut env, ticket)?;
         let stream = runtime()?
             .block_on(Client::connect_voice(&endpoint, &public_key, &ticket))
