@@ -14,6 +14,71 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Open the current user's copy of a v5 group message from the messenger JSON
+/// boundary. Recipient selection and envelope validation stay out of the UI.
+pub fn open_group_message(
+    identity: &crate::e2e::Identity,
+    sender_key: [u8; 32],
+    sender: &str,
+    recipient: &str,
+    raw: &str,
+) -> io::Result<Vec<u8>> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid group E2E envelope");
+    if raw.len() > 16 * 1024 * 1024 || recipient.is_empty() || recipient.len() > 64 {
+        return Err(invalid());
+    }
+    let value: JsonValue = serde_json::from_str(raw).map_err(|_| invalid())?;
+    if value.get("version").and_then(JsonValue::as_u64) != Some(5) { return Err(invalid()); }
+    let recipients = value.get("recipients").and_then(JsonValue::as_object).ok_or_else(invalid)?;
+    if recipients.is_empty() || recipients.len() > 256 { return Err(invalid()); }
+    let entry = recipients.get(recipient).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::PermissionDenied, "group E2E recipient is unavailable")
+    })?;
+    let version = entry.get("version").and_then(JsonValue::as_u64).ok_or_else(invalid)?;
+    if version != 3 && version != 4 { return Err(invalid()); }
+    let nonce = crate::decode_base64(entry.get("nonce").and_then(JsonValue::as_str).ok_or_else(invalid)?)?
+        .try_into().map_err(|_| invalid())?;
+    let mut ciphertext = crate::decode_base64(entry.get("ciphertext").and_then(JsonValue::as_str).ok_or_else(invalid)?)?;
+    if let Some(tag) = entry.get("tag").and_then(JsonValue::as_str).filter(|tag| !tag.is_empty()) {
+        let tag = crate::decode_base64(tag)?;
+        if tag.len() != 16 { return Err(invalid()); }
+        ciphertext.extend(tag);
+    }
+    let envelope = crate::e2e::Envelope { version: version as u8, nonce, ciphertext };
+    let group = crate::e2e::GroupEnvelope {
+        version: 5,
+        recipients: [(recipient.to_owned(), envelope)].into_iter().collect(),
+    };
+    identity.open_group(sender_key, sender, recipient, &group)
+}
+
+/// Unwrap a group's media key without exposing it across the UI boundary.
+pub fn group_media_decryptor(
+    identity: &crate::e2e::Identity,
+    sender_key: [u8; 32],
+    sender: &str,
+    recipient: &str,
+    raw: &str,
+) -> io::Result<crate::e2e::MediaDecryptor> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid group media envelope");
+    if raw.len() > 16 * 1024 * 1024 { return Err(invalid()); }
+    let value: JsonValue = serde_json::from_str(raw).map_err(|_| invalid())?;
+    if value.get("version").and_then(JsonValue::as_u64) != Some(5) { return Err(invalid()); }
+    let media = value.get("media").and_then(JsonValue::as_object).ok_or_else(invalid)?;
+    let recipients = media.get("key_recipients").ok_or_else(invalid)?;
+    let wrapped = json!({"version":5,"recipients":recipients}).to_string();
+    let key = zeroize::Zeroizing::new(open_group_message(identity, sender_key, sender, recipient, &wrapped)?);
+    if key.len() != 32 { return Err(invalid()); }
+    let aad = match media.get("aad") {
+        None => Vec::new(),
+        Some(value) => {
+            let value = value.as_str().ok_or_else(invalid)?;
+            if value.is_empty() { Vec::new() } else { crate::decode_base64(value)? }
+        },
+    };
+    crate::e2e::MediaDecryptor::with_key(&key, aad)
+}
+
 /// User-visible transport preference.  `Auto` always attempts native MST5
 /// candidates before M5oH candidates, regardless of their order in config.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -540,6 +605,68 @@ fn validate_session_values(values: &BTreeMap<String, String>) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    fn group_test_b64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut result = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = ((chunk[0] as u32) << 16)
+                | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+                | chunk.get(2).copied().unwrap_or(0) as u32;
+            result.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+            result.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+            result.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+            result.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        }
+        result
+    }
+
+    #[test]
+    fn group_media_json_unwraps_key_and_streams_plaintext() {
+        let alice = crate::e2e::Identity::from_private([3; 32]);
+        let bob = crate::e2e::Identity::from_private([4; 32]);
+        let key = [9u8; 32];
+        let wrapped = alice.seal(bob.public_key(), "3", "4", &key).unwrap();
+        let raw = serde_json::json!({"version":5,"media":{"aad":"", "key_recipients":{"4":{
+            "version":wrapped.version, "nonce":group_test_b64(&wrapped.nonce),
+            "ciphertext":group_test_b64(&wrapped.ciphertext)
+        }}}}).to_string();
+        let mut encoder = crate::e2e::MediaEncryptor::with_key(&key, Vec::new(), 5).unwrap();
+        let mut wire = encoder.header().to_vec();
+        wire.extend(encoder.seal_chunk(b"photo").unwrap());
+        encoder.finish().unwrap();
+        let mut decoder = super::group_media_decryptor(&bob, alice.public_key(), "3", "4", &raw).unwrap();
+        let mut plaintext = Vec::new();
+        for part in wire.chunks(7) {
+            for chunk in decoder.push(part).unwrap() { plaintext.extend(chunk); }
+        }
+        decoder.finish().unwrap();
+        assert_eq!(plaintext, b"photo");
+        assert!(super::group_media_decryptor(&bob, alice.public_key(), "3", "other", &raw).is_err());
+        let malformed = raw.replace("\"version\":5", "\"version\":4");
+        assert!(super::group_media_decryptor(&bob, alice.public_key(), "3", "4", &malformed).is_err());
+    }
+
+    #[test]
+    fn group_json_opens_only_the_authenticated_recipient() {
+        let alice = crate::e2e::Identity::from_private([3; 32]);
+        let bob = crate::e2e::Identity::from_private([4; 32]);
+        let sealed = alice.seal_group(&[("4".into(), bob.public_key())], "3", b"group message").unwrap();
+        let entry = &sealed.recipients["4"];
+        for separate_tag in [false, true] {
+            let split = if separate_tag { entry.ciphertext.len() - 16 } else { entry.ciphertext.len() };
+            let raw = serde_json::json!({"version":5, "recipients":{"4":{
+                "version":entry.version,
+                "nonce":group_test_b64(&entry.nonce),
+                "ciphertext":group_test_b64(&entry.ciphertext[..split]),
+                "tag":group_test_b64(&entry.ciphertext[split..])
+            }}}).to_string();
+            assert_eq!(super::open_group_message(&bob, alice.public_key(), "3", "4", &raw).unwrap(), b"group message");
+            assert!(super::open_group_message(&bob, alice.public_key(), "3", "5", &raw).is_err());
+            assert!(super::open_group_message(&bob, alice.public_key(), "other", "4", &raw).is_err());
+            assert!(super::open_group_message(&bob, bob.public_key(), "3", "4", &raw).is_err());
+        }
+    }
+
     use super::*;
 
     const CHAIN: &str = "http://cdn.example/10.100.2.228:8080|mst5://central.example:8067/main";

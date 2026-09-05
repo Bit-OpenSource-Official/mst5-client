@@ -745,6 +745,20 @@ pub struct Client {
     read_timeout: Duration,
 }
 
+// A connected socket must be closed if media authentication fails or its
+// future is cancelled. Disarm only when ownership reaches the caller.
+struct MediaConnectionGuard(Option<Client>);
+
+impl Drop for MediaConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { let _ = client.close().await; });
+            }
+        }
+    }
+}
+
 pub struct VoiceStream {
     client: Client,
     stream: connection::StreamHandle,
@@ -1102,7 +1116,8 @@ impl Client {
         pinned_public_key_b64: &str,
         ticket: &str,
     ) -> io::Result<Self> {
-        let client = Self::connect(endpoint, pinned_public_key_b64).await?;
+        let mut guard = MediaConnectionGuard(Some(Self::connect(endpoint, pinned_public_key_b64).await?));
+        let client = guard.0.as_ref().expect("media connection guard");
         if client.features & FEATURE_MEDIA_STREAMS == 0 {
             return Err(invalid_data("media node omitted MEDIA_STREAMS"));
         }
@@ -1131,7 +1146,7 @@ impl Client {
             expires_at: None,
             raw,
         })?;
-        Ok(client)
+        Ok(guard.0.take().expect("authenticated media connection"))
     }
 
     pub async fn connect_voice(
@@ -1653,6 +1668,23 @@ impl Client {
         let decryptor = e2e::MediaDecryptor::with_key(&media_key, file_aad)?;
         self.download_media_e2e_with_decryptor(file_id, expected_encrypted_size, target, decryptor)
             .await
+    }
+
+    /// Stream a group attachment using the recipient-specific wrapped key.
+    /// The unwrapped media key remains within the native client.
+    pub async fn download_group_media<W: AsyncWrite + Unpin>(
+        &self,
+        file_id: &str,
+        expected_encrypted_size: u64,
+        target: &mut W,
+        identity: &e2e::Identity,
+        sender_key: [u8; 32],
+        sender: &str,
+        recipient: &str,
+        envelope_json: &str,
+    ) -> io::Result<u64> {
+        let decryptor = messenger::group_media_decryptor(identity, sender_key, sender, recipient, envelope_json)?;
+        self.download_media_e2e_with_decryptor(file_id, expected_encrypted_size, target, decryptor).await
     }
 
     async fn download_media_e2e_with_decryptor<W: AsyncWrite + Unpin>(

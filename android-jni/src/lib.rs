@@ -580,6 +580,18 @@ struct JavaProgress {
 }
 
 impl JavaProgress {
+    fn check_cancelled(&self) -> io::Result<()> {
+        let mut env = self.vm.attach_current_thread()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let cancelled = env.call_method(self.observer.as_obj(), "isCancelled", "()Z", &[])
+            .and_then(|value| value.z())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if cancelled {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "media transfer cancelled"));
+        }
+        Ok(())
+    }
+
     fn new(
         env: &mut JNIEnv<'_>,
         observer: JObject<'_>,
@@ -637,6 +649,78 @@ impl JavaProgress {
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(())
+    }
+}
+
+async fn cancellable_download<T>(
+    operation: impl std::future::Future<Output = io::Result<T>>,
+    progress: Option<Arc<JavaProgress>>,
+) -> io::Result<T> {
+    let Some(progress) = progress else { return operation.await; };
+    poll_transfer_cancellation(operation, || progress.check_cancelled()).await
+}
+
+async fn poll_transfer_cancellation<T>(
+    operation: impl std::future::Future<Output = io::Result<T>>,
+    mut check: impl FnMut() -> io::Result<()>,
+) -> io::Result<T> {
+    check()?;
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(125)) => {
+                check()?;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_interrupts_a_stalled_download() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut checks = 0;
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                poll_transfer_cancellation(std::future::pending::<io::Result<()>>(), || {
+                    checks += 1;
+                    if checks > 1 {
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+                    } else { Ok(()) }
+                }),
+            ).await.expect("stalled download ignored cancellation");
+            assert_eq!(outcome.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(checks, 2);
+        });
+    }
+
+    #[test]
+    fn completed_download_returns_without_waiting_for_poll() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut checks = 0;
+        let result = rt.block_on(poll_transfer_cancellation(async { Ok(42) }, || {
+            checks += 1;
+            Ok(())
+        })).unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn already_cancelled_download_never_starts() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let mut started = false;
+        let result = rt.block_on(poll_transfer_cancellation(async {
+            started = true;
+            Ok(())
+        }, || Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!started);
     }
 }
 
@@ -1143,12 +1227,16 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownload(
             progress,
             completed: 0,
         };
+        let cancellation = target.progress.clone();
         runtime()?
             .block_on(async {
-                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
-                let result = client
-                    .download_media(&file_id, expected_size as u64, &mut target)
-                    .await;
+                let client = cancellable_download(
+                    Client::connect_media(&endpoint, &public_key, &ticket), cancellation.clone(),
+                ).await?;
+                let result = cancellable_download(
+                    client.download_media(&file_id, expected_size as u64, &mut target),
+                    cancellation,
+                ).await;
                 let _ = client.close().await;
                 result
             })
@@ -1193,18 +1281,20 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2EWithK
             progress: JavaProgress::new(&mut env, observer, 0)?,
             completed: 0,
         };
+        let cancellation = target.progress.clone();
         runtime()?
             .block_on(async {
-                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
-                let result = client
+                let client = cancellable_download(
+                    Client::connect_media(&endpoint, &public_key, &ticket), cancellation.clone(),
+                ).await?;
+                let result = cancellable_download(client
                     .download_media_e2e_with_key(
                         &file_id,
                         expected_encrypted_size as u64,
                         &mut target,
                         media_key,
                         file_aad,
-                    )
-                    .await;
+                    ), cancellation).await;
                 let _ = client.close().await;
                 result
             })
@@ -1253,10 +1343,13 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2E(
             progress: JavaProgress::new(&mut env, observer, 0)?,
             completed: 0,
         };
+        let cancellation = target.progress.clone();
         runtime()?
             .block_on(async {
-                let client = Client::connect_media(&endpoint, &public_key, &ticket).await?;
-                let result = client
+                let client = cancellable_download(
+                    Client::connect_media(&endpoint, &public_key, &ticket), cancellation.clone(),
+                ).await?;
+                let result = cancellable_download(client
                     .download_media_e2e(
                         &file_id,
                         expected_encrypted_size as u64,
@@ -1265,8 +1358,7 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2E(
                         peer,
                         &from,
                         &to,
-                    )
-                    .await;
+                    ), cancellation).await;
                 let _ = client.close().await;
                 result
             })
@@ -1278,6 +1370,59 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadE2E(
             throw_io(&mut env, error);
             -1
         }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeDownloadGroupMedia(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    endpoint: JString<'_>,
+    public_key: JString<'_>,
+    ticket: JString<'_>,
+    file_id: JString<'_>,
+    expected_size: jlong,
+    fd: jint,
+    identity_handle: jlong,
+    sender_key: JByteArray<'_>,
+    sender: JString<'_>,
+    recipient: JString<'_>,
+    envelope: JString<'_>,
+    observer: JObject<'_>,
+) -> jlong {
+    let result = (|| -> Result<u64, String> {
+        if expected_size < 0 || fd < 0 { return Err("invalid group media target".into()); }
+        let key: [u8; 32] = java_bytes(&mut env, sender_key)?.try_into()
+            .map_err(|_| "E2E sender key must be 32 bytes".to_string())?;
+        let (endpoint, public_key, ticket, file_id) =
+            transfer_strings(&mut env, endpoint, public_key, ticket, file_id)?;
+        let sender = java_string(&mut env, sender)?;
+        let recipient = java_string(&mut env, recipient)?;
+        let envelope = java_string(&mut env, envelope)?;
+        let identity = identity(identity_handle)?;
+        let file = duplicate_file(fd)?;
+        let progress = JavaProgress::new(&mut env, observer, 0)?;
+        let mut target = ProgressWriter {
+            inner: tokio::fs::File::from_std(file),
+            progress: progress.clone(),
+            completed: 0,
+        };
+        runtime()?.block_on(async {
+            let client = cancellable_download(
+                Client::connect_media(&endpoint, &public_key, &ticket), progress.clone(),
+            ).await?;
+            let result = cancellable_download(
+                client.download_group_media(&file_id, expected_size as u64, &mut target,
+                    &identity, key, &sender, &recipient, &envelope),
+                progress,
+            ).await;
+            let _ = client.close().await;
+            result
+        }).map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(size) => size as jlong,
+        Err(error) => { throw_io(&mut env, error); -1 }
     }
 }
 
@@ -1757,6 +1902,35 @@ pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EDecrypt(
             throw_io(&mut env, error);
             std::ptr::null_mut()
         }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_rs_ove_crypt_proto_NativeMst5_nativeE2EOpenGroup(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+    sender_key: JByteArray<'_>,
+    sender: JString<'_>,
+    recipient: JString<'_>,
+    envelope: JString<'_>,
+) -> jbyteArray {
+    let result = (|| -> Result<Vec<u8>, String> {
+        let key: [u8; 32] = java_bytes(&mut env, sender_key)?.try_into()
+            .map_err(|_| "E2E sender key must be 32 bytes".to_string())?;
+        let sender = java_string(&mut env, sender)?;
+        let recipient = java_string(&mut env, recipient)?;
+        let envelope = java_string(&mut env, envelope)?;
+        mst5_client::messenger::open_group_message(
+            identity(handle)?.as_ref(), key, &sender, &recipient, &envelope,
+        ).map_err(|error| error.to_string())
+    })();
+    match result {
+        Ok(value) => match env.byte_array_from_slice(&value) {
+            Ok(array) => array.into_raw(),
+            Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
+        },
+        Err(error) => { throw_io(&mut env, error); std::ptr::null_mut() }
     }
 }
 

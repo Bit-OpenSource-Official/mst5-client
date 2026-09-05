@@ -23,8 +23,8 @@ jobs:
           [[ -n "${CRYPT_SERVER_PUBLIC_KEY_B64:-}" ]]
           decoded_size="$(printf '%s' "$CRYPT_SERVER_PUBLIC_KEY_B64" | base64 --decode | wc -c)"
           [[ "$decoded_size" == 32 ]]
-      - run: cargo test --locked --lib
-      - run: cargo test --locked --manifest-path ffi/Cargo.toml
+      - name: Test SDK, shared E2E, Android JNI and C ABI
+        run: make test
       - name: Native C ABI smoke
         run: |
           cargo build --locked --release --manifest-path ffi/Cargo.toml

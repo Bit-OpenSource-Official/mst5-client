@@ -1032,6 +1032,34 @@ mod tests {
     }
 
     #[test]
+    fn media_rejects_truncated_and_corrupted_streams() {
+        let alice = Identity::from_private([3; 32]);
+        let bob = Identity::from_private([4; 32]);
+        let plaintext = vec![0x5a; MEDIA_CHUNK_SIZE + 17];
+        let mut encryptor = alice
+            .media_encryptor(bob.public_key(), "3", "4", "file-a", plaintext.len() as u64)
+            .unwrap();
+        let mut encoded = encryptor.header().to_vec();
+        for chunk in plaintext.chunks(MEDIA_CHUNK_SIZE) {
+            encoded.extend(encryptor.seal_chunk(chunk).unwrap());
+        }
+        encryptor.finish().unwrap();
+        for length in [0, 1, MEDIA_HEADER_SIZE - 1, MEDIA_HEADER_SIZE,
+                       encoded.len() / 2, encoded.len() - 1] {
+            let mut decoder = bob.media_decryptor(alice.public_key(), "3", "4", "file-a").unwrap();
+            assert!(decoder.push(&encoded[..length]).is_err() || decoder.finish().is_err(),
+                    "accepted truncated media at {length}");
+        }
+        for index in [0, MEDIA_HEADER_SIZE, encoded.len() / 2, encoded.len() - 1] {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= 1;
+            let mut decoder = bob.media_decryptor(alice.public_key(), "3", "4", "file-a").unwrap();
+            assert!(decoder.push(&corrupted).is_err() || decoder.finish().is_err(),
+                    "accepted corrupted media at {index}");
+        }
+    }
+
+    #[test]
     fn backup_round_trip_and_wrong_password() {
         let identity = Identity::from_private([7; 32]);
         let backup = identity.backup("correct horse").unwrap();

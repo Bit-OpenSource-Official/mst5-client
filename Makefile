@@ -18,6 +18,8 @@ help:
 
 test:
 	@cargo test --locked --lib
+	@cargo test --locked -p mst5-e2e-core
+	@cargo test --locked --manifest-path android-jni/Cargo.toml
 	@cargo test --locked --manifest-path ffi/Cargo.toml
 
 ffi:
